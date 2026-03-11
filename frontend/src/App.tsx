@@ -2,8 +2,8 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import Layout from "./components/Layout";
 import Dashboard from "./views/Dashboard";
-import ChatsView from "./views/ChatsView";
-import MemoriesView from "./views/MemoriesView";
+import Chats from "./views/Chats";
+import Memories from "./views/Memories";
 
 export default function App() {
   return (
@@ -12,8 +12,8 @@ export default function App() {
         <Route element={<Layout />}>
           <Route index element={<Dashboard />} />
           <Route path="/dashboard" element={<Navigate replace to="/" />} />
-          <Route path="/memories" element={<MemoriesView />} />
-          <Route path="/chats" element={<ChatsView />} />
+          <Route path="/memories" element={<Memories />} />
+          <Route path="/chats" element={<Chats />} />
         </Route>
       </Routes>
     </BrowserRouter>

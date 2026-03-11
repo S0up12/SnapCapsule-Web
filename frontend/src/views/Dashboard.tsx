@@ -7,6 +7,7 @@ import {
   LoaderCircle,
   MessageSquareText,
   Sparkles,
+  StopCircle,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -19,6 +20,8 @@ type IngestStatus = {
   ingestion_running: boolean;
   imports_dir: string;
   latest_zip: string;
+  latest_import: string;
+  latest_import_kind: string;
 };
 
 type ToastState = {
@@ -53,12 +56,28 @@ export default function Dashboard() {
   const [status, setStatus] = useState<IngestStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const ingestionRunning = Boolean(status?.ingestion_running) || importing;
 
   useEffect(() => {
     void refreshStatus();
   }, []);
+
+  useEffect(() => {
+    if (!ingestionRunning) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshStatus(false);
+    }, 2000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [ingestionRunning]);
 
   useEffect(() => {
     if (!toast) {
@@ -74,9 +93,11 @@ export default function Dashboard() {
     };
   }, [toast]);
 
-  async function refreshStatus() {
+  async function refreshStatus(showLoading = true) {
     try {
-      setLoading(true);
+      if (showLoading) {
+        setLoading(true);
+      }
       const response = await fetch("/api/ingest/status");
       if (!response.ok) {
         throw new Error(`Status request failed with ${response.status}`);
@@ -92,13 +113,18 @@ export default function Dashboard() {
           : "Unknown request error",
       );
     } finally {
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
   }
 
   async function triggerImport() {
     try {
       setImporting(true);
+      setStatus((current) =>
+        current ? { ...current, ingestion_running: true } : current,
+      );
       setToast({
         tone: "info",
         message: "Import started. Waiting for backend response...",
@@ -119,18 +145,55 @@ export default function Dashboard() {
           ? `Import completed for ${payload.zip_file}.`
           : "Import completed successfully.",
       });
+    } catch (requestError) {
+      const message =
+        requestError instanceof Error
+          ? requestError.message
+          : "Import failed unexpectedly.";
 
-      await refreshStatus();
+      setToast({
+        tone: /cancel/i.test(message) ? "info" : "error",
+        message,
+      });
+    } finally {
+      setImporting(false);
+      await refreshStatus(false);
+    }
+  }
+
+  async function cancelImport() {
+    try {
+      setCancelling(true);
+      const response = await fetch("/api/ingest/cancel", {
+        method: "POST",
+      });
+      const payload = (await response.json()) as { detail?: string };
+
+      if (!response.ok) {
+        throw new Error(
+          payload.detail || `Cancel request failed with ${response.status}`,
+        );
+      }
+
+      setToast({
+        tone: "info",
+        message:
+          payload.detail || "Cancellation requested. Waiting for import to stop.",
+      });
+      setStatus((current) =>
+        current ? { ...current, ingestion_running: true } : current,
+      );
+      await refreshStatus(false);
     } catch (requestError) {
       setToast({
         tone: "error",
         message:
           requestError instanceof Error
             ? requestError.message
-            : "Import failed unexpectedly.",
+            : "Cancel request failed unexpectedly.",
       });
     } finally {
-      setImporting(false);
+      setCancelling(false);
     }
   }
 
@@ -154,19 +217,35 @@ export default function Dashboard() {
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={() => void triggerImport()}
-                disabled={importing}
-                className="inline-flex items-center gap-2 rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-cyan-500/60"
-              >
-                {importing ? (
-                  <LoaderCircle className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Download className="h-4 w-4" />
-                )}
-                <span>{importing ? "Importing..." : "Import Data"}</span>
-              </button>
+              {ingestionRunning ? (
+                <button
+                  type="button"
+                  onClick={() => void cancelImport()}
+                  disabled={cancelling}
+                  className="inline-flex items-center gap-2 rounded-2xl bg-rose-500 px-5 py-3 text-sm font-semibold text-white transition hover:bg-rose-400 disabled:cursor-not-allowed disabled:bg-rose-500/60"
+                >
+                  {cancelling ? (
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <StopCircle className="h-4 w-4" />
+                  )}
+                  <span>{cancelling ? "Cancelling..." : "Cancel Import"}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void triggerImport()}
+                  disabled={importing}
+                  className="inline-flex items-center gap-2 rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-cyan-500/60"
+                >
+                  {importing ? (
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Download className="h-4 w-4" />
+                  )}
+                  <span>{importing ? "Importing..." : "Import Data"}</span>
+                </button>
+              )}
 
               <button
                 type="button"
@@ -188,20 +267,28 @@ export default function Dashboard() {
               <span
                 className={[
                   "rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em]",
-                  status?.ingestion_running
+                  ingestionRunning
                     ? "bg-amber-400/15 text-amber-200"
                     : "bg-emerald-400/15 text-emerald-200",
                 ].join(" ")}
               >
-                {status?.ingestion_running ? "Running" : "Idle"}
+                {ingestionRunning ? "Running" : "Idle"}
               </span>
             </div>
 
             <div className="mt-5 space-y-4 text-sm">
               <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                <p className="text-slate-400">Latest ZIP</p>
+                <p className="text-slate-400">Latest Import Source</p>
                 <p className="mt-2 truncate text-base text-white">
-                  {status?.latest_zip || "No ZIP detected in imports directory"}
+                  {status?.latest_import ||
+                    "No archive or extracted export detected in imports directory"}
+                </p>
+                <p className="mt-2 text-xs uppercase tracking-[0.2em] text-slate-500">
+                  {status?.latest_import_kind === "folder"
+                    ? "Pre-extracted folder"
+                    : status?.latest_import_kind === "archive"
+                      ? "Archive file"
+                      : "No source detected"}
                 </p>
               </div>
               <div className="rounded-2xl border border-white/10 bg-white/5 p-4">

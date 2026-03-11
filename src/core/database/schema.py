@@ -202,6 +202,29 @@ class DatabaseManager:
             conn.execute("DELETE FROM message_media")
             conn.execute("DELETE FROM messages")
 
+    def clear_messages_for_conversations(self, usernames: list[str]):
+        usernames = [username for username in usernames if username]
+        if not usernames:
+            return
+
+        placeholders = ",".join("?" for _ in usernames)
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                DELETE FROM message_media
+                WHERE message_id IN (
+                    SELECT id
+                    FROM messages
+                    WHERE username IN ({placeholders})
+                )
+                """,
+                usernames,
+            )
+            conn.execute(
+                f"DELETE FROM messages WHERE username IN ({placeholders})",
+                usernames,
+            )
+
     def get_conversations(self):
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
