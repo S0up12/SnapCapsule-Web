@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from core.database.schema import DatabaseManager
@@ -45,11 +47,13 @@ def list_conversation_messages(
         media_items: list[dict] = []
         for media_ref in message.media_refs:
             overlay = resolve_overlay_path(media_ref, None)
-            media_url = build_media_url(request, media_ref)
+            web_media_path = processor.get_web_media_sync(Path(media_ref), timeout=60)
+            media_source = web_media_path or Path(media_ref)
+            media_url = build_media_url(request, media_source)
             thumbnail_url = ensure_thumbnail_url(
                 request,
                 processor,
-                media_ref,
+                media_source,
                 overlay_path=overlay,
             )
             media_items.append(

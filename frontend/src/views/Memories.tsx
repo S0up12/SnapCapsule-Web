@@ -1,12 +1,11 @@
 import {
-  Clapperboard,
   Expand,
   Heart,
   ImageIcon,
   LoaderCircle,
-  X,
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import Lightbox from "../components/Lightbox";
 
 type MemoryItem = {
   asset_id: string;
@@ -97,27 +96,6 @@ export default function Memories() {
   useEffect(() => {
     void fetchMemories(0, false);
   }, []);
-
-  useEffect(() => {
-    if (!selectedMemory) {
-      return undefined;
-    }
-
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setSelectedMemory(null);
-      }
-    };
-
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", handleEscape);
-
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", handleEscape);
-    };
-  }, [selectedMemory]);
 
   async function fetchMemories(skip: number, append: boolean) {
     try {
@@ -327,63 +305,13 @@ export default function Memories() {
       </section>
 
       {selectedMemory ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 backdrop-blur-md"
-          onClick={() => setSelectedMemory(null)}
-        >
-          <div
-            className="relative flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-[2rem] border border-white/10 bg-[#060c14] shadow-2xl shadow-black/50"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">
-                  Media Viewer
-                </p>
-                <p className="mt-2 text-sm text-slate-200">
-                  {formatMemoryLabel(selectedMemory)}
-                </p>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => setSelectedMemory(null)}
-                className="rounded-2xl border border-white/10 bg-white/[0.05] p-3 text-slate-200 transition hover:bg-white/[0.1]"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            <div className="flex min-h-0 flex-1 items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(24,38,59,0.45),_rgba(4,6,10,0.96)_60%)] p-4 sm:p-6">
-              {selectedMemory.media_url ? (
-                isVideo(selectedMemory) ? (
-                  <div className="w-full">
-                    <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-cyan-100">
-                      <Clapperboard className="h-3.5 w-3.5" />
-                      Video
-                    </div>
-                    <video
-                      src={selectedMemory.media_url}
-                      controls
-                      autoPlay
-                      className="max-h-[72vh] w-full rounded-[1.5rem] border border-white/10 bg-black object-contain"
-                    />
-                  </div>
-                ) : (
-                  <img
-                    src={selectedMemory.media_url}
-                    alt={formatMemoryLabel(selectedMemory)}
-                    className="max-h-[78vh] w-full rounded-[1.5rem] border border-white/10 bg-black object-contain"
-                  />
-                )
-              ) : (
-                <div className="flex min-h-[320px] items-center justify-center rounded-[1.5rem] border border-white/10 bg-white/[0.03] px-6 text-center text-slate-400">
-                  Full-resolution media is unavailable for this memory.
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+        <Lightbox
+          mediaUrl={selectedMemory.media_url}
+          overlayUrl={selectedMemory.overlay_url}
+          isVideo={isVideo(selectedMemory)}
+          title={formatMemoryLabel(selectedMemory)}
+          onClose={() => setSelectedMemory(null)}
+        />
       ) : null}
     </div>
   );

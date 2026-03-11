@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, Request
+from pathlib import Path
 
 from core.database.schema import DatabaseManager
 from core.services.media_processor import MediaProcessor
@@ -24,11 +25,13 @@ def list_memories(
     items: list[dict] = []
     for asset_id, file_path, file_type, overlay_path, year, is_favorite in rows:
         overlay = resolve_overlay_path(file_path, overlay_path)
-        media_url = build_media_url(request, file_path)
+        web_media_path = processor.get_web_media_sync(Path(file_path), timeout=60)
+        media_source = web_media_path or Path(file_path)
+        media_url = build_media_url(request, media_source)
         thumbnail_url = ensure_thumbnail_url(
             request,
             processor,
-            file_path,
+            media_source,
             overlay_path=overlay,
         )
 

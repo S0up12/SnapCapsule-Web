@@ -6,6 +6,13 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
 MEDIA_SUFFIXES = ["_overlay", "_caption", "_image", "_video", "_media", "_main"]
 
 
+def _strip_media_suffix(stem: str) -> str:
+    for suffix in MEDIA_SUFFIXES:
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)]
+    return stem
+
+
 def resolve_preferred_image_path(file_path: str) -> str:
     try:
         path = Path(file_path)
@@ -56,6 +63,15 @@ def find_caption_overlay(file_path: str) -> Optional[str]:
         path = Path(file_path)
     except Exception:
         return None
-    stem = path.stem[:-6] if path.stem.endswith("_image") else path.stem
-    candidate = path.with_name(f"{stem}_caption.png")
-    return str(candidate) if candidate.exists() else None
+
+    stem = _strip_media_suffix(path.stem)
+    candidates = [
+        path.with_name(f"{stem}_caption.png"),
+        path.with_name(f"{stem}_overlay.png"),
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return None

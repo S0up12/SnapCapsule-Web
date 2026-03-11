@@ -7,6 +7,7 @@ import {
   Video,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import Lightbox from "../components/Lightbox";
 
 type ConversationApiItem = {
   username: string;
@@ -26,6 +27,13 @@ type ChatMedia = {
   media_url: string | null;
   thumbnail_url: string | null;
   overlay_url: string | null;
+};
+
+type SelectedMedia = {
+  mediaUrl: string | null;
+  overlayUrl: string | null;
+  isVideo: boolean;
+  title: string;
 };
 
 type ChatMessage = {
@@ -110,6 +118,7 @@ export default function Chats() {
   const [messageError, setMessageError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [showSidebarOnMobile, setShowSidebarOnMobile] = useState(true);
+  const [selectedMedia, setSelectedMedia] = useState<SelectedMedia | null>(null);
   const messagesViewportRef = useRef<HTMLDivElement | null>(null);
 
   const selectedConversation = useMemo(
@@ -526,14 +535,32 @@ export default function Chats() {
                                           src={mediaUrl || previewUrl}
                                           controls
                                           preload="metadata"
-                                          className="max-h-[360px] w-full bg-black object-cover"
+                                          onClick={(event) => {
+                                            event.preventDefault();
+                                            event.currentTarget.pause();
+                                            setSelectedMedia({
+                                              mediaUrl: mediaUrl || previewUrl,
+                                              overlayUrl: media.overlay_url,
+                                              isVideo: true,
+                                              title: message.content || "Chat media",
+                                            });
+                                          }}
+                                          className="max-h-[360px] w-full cursor-pointer bg-black object-cover transition-opacity hover:opacity-90"
                                         />
                                       ) : (
                                         <img
                                           src={previewUrl}
                                           alt={message.content || "Chat media"}
                                           loading="lazy"
-                                          className="max-h-[420px] w-full object-cover"
+                                          onClick={() =>
+                                            setSelectedMedia({
+                                              mediaUrl: mediaUrl || previewUrl,
+                                              overlayUrl: media.overlay_url,
+                                              isVideo: false,
+                                              title: message.content || "Chat media",
+                                            })
+                                          }
+                                          className="max-h-[420px] w-full cursor-pointer object-cover transition-opacity hover:opacity-90"
                                         />
                                       )}
                                     </div>
@@ -585,6 +612,16 @@ export default function Chats() {
           </div>
         )}
       </section>
+
+      {selectedMedia ? (
+        <Lightbox
+          mediaUrl={selectedMedia.mediaUrl}
+          overlayUrl={selectedMedia.overlayUrl}
+          isVideo={selectedMedia.isVideo}
+          title={selectedMedia.title}
+          onClose={() => setSelectedMedia(null)}
+        />
+      ) : null}
     </div>
   );
 }
