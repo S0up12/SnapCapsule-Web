@@ -26,23 +26,74 @@ SnapCapsule Web is a self-hosted Snapchat archive browser built around a FastAPI
 - Backend: `http://localhost:8000`
 - Frontend: `http://localhost:3000`
 
-## Quick Start
+## Self-Hosting (Portainer / ZimaOS)
+
+SnapCapsule Web is designed for home-lab deployment first. The easiest install path is Docker Compose, and the intended appliance-style workflow is Portainer or a Portainer-based environment such as ZimaOS.
+
+### Portainer Stack Deployment
+
+1. In Portainer, open `Stacks`.
+2. Create a new stack from your Git repository or paste the repository Compose file.
+3. Deploy the stack using the included `docker-compose.yml`.
+4. After the containers start, open the frontend on port `3000`.
+
+The backend stores everything under `/data` inside the container. You control where that data lives on the host through environment-variable-backed bind mounts.
+
+### Environment Variables
+
+The backend service supports three storage path variables:
+
+- `DATABASE_DIR`
+  Host path for SQLite and staged metadata
+- `CACHE_DIR`
+  Host path for thumbnails and browser-safe transcoded video cache
+- `IMPORTS_DIR`
+  Host path for incoming Snapchat archives and extracted media
+
+In Portainer, add these as stack environment variables and point them at your preferred NAS or storage locations. Example host paths:
+
+- `DATABASE_DIR=/mnt/storage/appdata/snapcapsule/database`
+- `CACHE_DIR=/mnt/storage/appdata/snapcapsule/cache`
+- `IMPORTS_DIR=/mnt/storage/media/snapchat-imports`
+
+If you do not define them, Compose falls back to local project folders under `./data`.
+
+## Setup
+
+### Option 1: Docker Compose on a local machine
 
 ```bash
 docker compose up -d --build
 ```
 
-Persistent data is stored in:
+By default, persistent data is stored in:
 
 - `./data/database`
 - `./data/cache`
 - `./data/imports`
 
+To override those locations, copy `.env.example` to `.env` and set your host paths before starting the stack.
+
+### Option 2: Portainer or ZimaOS
+
+- Create a stack from this repository
+- Set `DATABASE_DIR`, `CACHE_DIR`, and `IMPORTS_DIR` in the Portainer environment-variable UI if you want custom storage locations
+- Deploy the stack
+
+## Run
+
+Once the stack is up:
+
+1. Open the frontend at `http://<your-server>:3000`
+2. Place Snapchat export files in your mapped imports directory
+3. Start the import from the Dashboard
+4. Browse memories and chats after ingestion completes
+
 ## Import Workflow
 
-1. Drop a Snapchat export archive into `./data/imports`.
+1. Drop a Snapchat export archive into your mapped imports directory.
    Supported formats: `.zip`, `.rar`, `.7z`
-2. If you already extracted the export, place the extracted folder under `./data/imports`, `./data/imports/extracted`, or `./data/imports/raw`.
+2. If you already extracted the export, place the extracted folder under the imports root, `extracted`, or `raw` inside that mapped location.
 3. Start the import from the dashboard or via:
 
 ```bash
@@ -77,6 +128,8 @@ curl -X POST http://localhost:8000/api/ingest/cancel
   Extracted raw media files
 
 ## Development
+
+The project is release-oriented and container-first, but local development is still straightforward.
 
 ### Backend
 

@@ -12,9 +12,9 @@ services:
       SNAPCAPSULE_CACHE_DIR: /data/cache
       SNAPCAPSULE_IMPORTS_DIR: /data/imports
     volumes:
-      - ./data/database:/data/database
-      - ./data/cache:/data/cache
-      - ./data/imports:/data/imports
+      - ${DATABASE_DIR:-./data/database}:/data/database
+      - ${CACHE_DIR:-./data/cache}:/data/cache
+      - ${IMPORTS_DIR:-./data/imports}:/data/imports
     restart: unless-stopped
   snapcapsule-frontend:
     build:
