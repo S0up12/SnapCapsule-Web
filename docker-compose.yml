@@ -1,8 +1,7 @@
 services:
   snapcapsule-backend:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # Replace <your-github-username> with your actual GitHub username in lowercase.
+    image: ghcr.io/<your-github-username>/snapcapsule-backend:latest
     container_name: snapcapsule-backend
     ports:
       - "${BACKEND_PORT:-8000}:8000"
@@ -17,9 +16,8 @@ services:
       - ${IMPORTS_DIR:-./data/imports}:/data/imports
     restart: unless-stopped
   snapcapsule-frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    # Replace <your-github-username> with your actual GitHub username in lowercase.
+    image: ghcr.io/<your-github-username>/snapcapsule-frontend:latest
     container_name: snapcapsule-frontend
     depends_on:
       - snapcapsule-backend

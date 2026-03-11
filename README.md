@@ -33,9 +33,13 @@ SnapCapsule Web is designed for home-lab deployment first. The easiest install p
 ### Portainer Stack Deployment
 
 1. In Portainer, open `Stacks`.
-2. Create a new stack from your Git repository or paste the repository Compose file.
-3. Deploy the stack using the included `docker-compose.yml`.
-4. After the containers start, open the frontend on port `3000`.
+2. Create a new stack with the Web Editor.
+3. Paste the contents of `docker-compose.yml` into the editor.
+4. Replace `<your-github-username>` in the image tags with the GitHub username that owns the published GHCR images.
+5. Set your environment variables in the Portainer stack UI.
+6. Click `Deploy the stack`.
+
+After the containers start, open the frontend on the configured `FRONTEND_PORT`. Users no longer need to build the repository on the target server. Deployment is now pull-only.
 
 The backend stores everything under `/data` inside the container. You control where that data lives on the host through environment-variable-backed bind mounts.
 
@@ -70,7 +74,7 @@ If your server reports `port is already allocated`, change `FRONTEND_PORT` and/o
 ### Option 1: Docker Compose on a local machine
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 By default, persistent data is stored in:
@@ -83,8 +87,10 @@ To override those locations, copy `.env.example` to `.env` and set your host pat
 
 ### Option 2: Portainer or ZimaOS
 
-- Create a stack from this repository
-- Set `DATABASE_DIR`, `CACHE_DIR`, and `IMPORTS_DIR` in the Portainer environment-variable UI if you want custom storage locations
+- Create a stack with the Portainer Web Editor
+- Paste in `docker-compose.yml`
+- Replace `<your-github-username>` in the GHCR image references
+- Set `DATABASE_DIR`, `CACHE_DIR`, `IMPORTS_DIR`, `FRONTEND_PORT`, and `BACKEND_PORT` in the Portainer environment-variable UI if needed
 - Deploy the stack
 
 ## Run
