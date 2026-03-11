@@ -34,7 +34,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/snapcapsule-backend:latest
+          tags: ghcr.io/s0up12/snapcapsule-backend:latest
 
       - name: Build and push frontend image
         uses: docker/build-push-action@v6
@@ -42,4 +42,4 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/snapcapsule-frontend:latest
+          tags: ghcr.io/s0up12/snapcapsule-frontend:latest
