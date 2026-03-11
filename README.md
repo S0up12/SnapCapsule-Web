@@ -49,14 +49,21 @@ The backend service supports three storage path variables:
   Host path for thumbnails and browser-safe transcoded video cache
 - `IMPORTS_DIR`
   Host path for incoming Snapchat archives and extracted media
+- `FRONTEND_PORT`
+  Host port published for the web UI, default `3000`
+- `BACKEND_PORT`
+  Host port published for the FastAPI API, default `8000`
 
 In Portainer, add these as stack environment variables and point them at your preferred NAS or storage locations. Example host paths:
 
 - `DATABASE_DIR=/mnt/storage/appdata/snapcapsule/database`
 - `CACHE_DIR=/mnt/storage/appdata/snapcapsule/cache`
 - `IMPORTS_DIR=/mnt/storage/media/snapchat-imports`
+- `FRONTEND_PORT=3000`
+- `BACKEND_PORT=8000`
 
 If you do not define them, Compose falls back to local project folders under `./data`.
+If your server reports `port is already allocated`, change `FRONTEND_PORT` and/or `BACKEND_PORT` in Portainer before deploying the stack.
 
 ## Setup
 
