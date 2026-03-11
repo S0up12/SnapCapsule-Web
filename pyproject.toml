@@ -14,6 +14,8 @@ pillow = "^10.2.0"
 opencv-python = "^4.9.0.80"
 beautifulsoup4 = "^4.12.3"
 pydantic = "^2.6.1"
+py7zr = "^0.22.0"
+rarfile = "^4.2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
