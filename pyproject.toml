@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "snapcapsule"
+version = "2.0.0"
+description = "A self-hosted Snapchat export processing service."
+authors = ["S0up12"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.115.12"
+uvicorn = {extras = ["standard"], version = "^0.34.0"}
+numpy = "<2"
+pillow = "^10.2.0"
+opencv-python = "^4.9.0.80"
+beautifulsoup4 = "^4.12.3"
+pydantic = "^2.6.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.5"
+black = "^24.2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

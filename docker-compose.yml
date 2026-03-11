@@ -1,0 +1,28 @@
+services:
+  snapcapsule-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: snapcapsule-backend
+    ports:
+      - "8000:8000"
+    environment:
+      SNAPCAPSULE_DATA_DIR: /data
+      SNAPCAPSULE_DATABASE_DIR: /data/database
+      SNAPCAPSULE_CACHE_DIR: /data/cache
+      SNAPCAPSULE_IMPORTS_DIR: /data/imports
+    volumes:
+      - ./data/database:/data/database
+      - ./data/cache:/data/cache
+      - ./data/imports:/data/imports
+    restart: unless-stopped
+  snapcapsule-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: snapcapsule-frontend
+    depends_on:
+      - snapcapsule-backend
+    ports:
+      - "3000:80"
+    restart: unless-stopped
