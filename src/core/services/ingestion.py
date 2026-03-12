@@ -1,25 +1,56 @@
 import json
+import mimetypes
 import re
 import shutil
 import threading
 import zipfile
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
+import httpx
 import py7zr
 import rarfile
 
 from core.database.schema import DatabaseManager
 from core.models import Message, MediaAsset
 from core.utils.logger import get_logger
-from core.utils.paths import get_app_data_dir
+from core.utils.media_paths import is_overlay_variant, normalize_media_stem
+from core.utils.paths import get_app_data_dir, get_raw_media_dir
 from bs4 import BeautifulSoup
 
 logger = get_logger("IngestionService")
 
+ProgressCallback = Callable[[float, str], None]
+_MEMORY_CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+}
+_ARCHIVE_PART_RE = re.compile(r"^(?P<family>.+?)(?:-(?P<part>\d+))?$")
+
 class IngestionCancelled(Exception):
     pass
+
+@dataclass
+class IngestionJobStatus:
+    running: bool = False
+    current_step: str = "Idle"
+    overall_progress: float = 0.0
+    current_archive: str = ""
+    current_archive_index: int = 0
+    current_archive_total: int = 0
+    download_total: int = 0
+    download_completed: int = 0
+    download_skipped: int = 0
+    download_failed: int = 0
 
 class IngestionService:
     EXPORT_MARKER_FILES = (
@@ -40,12 +71,122 @@ class IngestionService:
         self.media_match_mode: str = "strict"
         self._cancel_requested = threading.Event()
         self._last_run_cancelled = False
+        self._status_lock = threading.Lock()
+        self._job_status = IngestionJobStatus()
 
     def request_cancel(self) -> None:
         self._cancel_requested.set()
 
     def was_cancelled(self) -> bool:
         return self._last_run_cancelled
+
+    def get_job_status(self) -> dict[str, Any]:
+        with self._status_lock:
+            return asdict(self._job_status)
+
+    def _reset_job_status(self) -> None:
+        with self._status_lock:
+            self._job_status = IngestionJobStatus()
+
+    def _update_job_status(self, **updates: Any) -> None:
+        with self._status_lock:
+            for key, value in updates.items():
+                setattr(self._job_status, key, value)
+
+    @staticmethod
+    def _normalize_member_name(name: str) -> str:
+        return name.replace("\\", "/").lstrip("./")
+
+    def _members_have_media_roots(self, names: List[str]) -> bool:
+        normalized = [self._normalize_member_name(name) for name in names]
+        return any(
+            name.startswith("memories/") or name.startswith("chat_media/")
+            for name in normalized
+        )
+
+    def contains_archive_data(self, archive_path: Path) -> bool:
+        try:
+            names = self.list_archive_members(archive_path)
+        except Exception:
+            return False
+
+        normalized = [self._normalize_member_name(name) for name in names]
+        has_markers = any(
+            name.endswith(marker)
+            for name in normalized
+            for marker in (
+                "json/chat_history.json",
+                "json/memories_history.json",
+                "json/snap_history.json",
+                "json/account.json",
+                "json/user_profile.json",
+                "chat_history.json",
+                "memories_history.json",
+                "snap_history.json",
+                "account.json",
+                "user_profile.json",
+            )
+        )
+        has_html = any(
+            name.endswith("html/chat_history") or "html/chat_history/" in name
+            for name in normalized
+        )
+        return has_markers or has_html or self._members_have_media_roots(normalized)
+
+    def _archive_family_key(
+        self,
+        archive_path: Path,
+        known_stems: Optional[set[str]] = None,
+    ) -> tuple[str, int]:
+        stem = archive_path.stem
+        match = re.match(r"^(?P<family>.+)-(?P<part>\d+)$", stem)
+        if not match:
+            return stem, 0
+
+        family = match.group("family")
+        if known_stems is not None and family not in known_stems:
+            return stem, 0
+
+        return family, int(match.group("part"))
+
+    def list_pending_archives(self, pending_dir: Path) -> list[Path]:
+        pending_dir = Path(pending_dir)
+        archives = [
+            candidate
+            for suffix in self.ARCHIVE_SUFFIXES
+            for candidate in pending_dir.glob(f"*{suffix}")
+            if candidate.is_file()
+        ]
+        valid_archives = [candidate for candidate in archives if self.contains_archive_data(candidate)]
+        if not valid_archives:
+            return []
+
+        known_stems = {archive_path.stem for archive_path in valid_archives}
+        family_times: dict[str, float] = {}
+        for archive_path in valid_archives:
+            family, _ = self._archive_family_key(archive_path, known_stems)
+            family_times.setdefault(family, archive_path.stat().st_mtime)
+            family_times[family] = min(family_times[family], archive_path.stat().st_mtime)
+
+        return sorted(
+            valid_archives,
+            key=lambda candidate: (
+                family_times[self._archive_family_key(candidate, known_stems)[0]],
+                self._archive_family_key(candidate, known_stems)[0].lower(),
+                self._archive_family_key(candidate, known_stems)[1],
+                candidate.name.lower(),
+            ),
+        )
+
+    def get_status_snapshot(self, pending_dir: Path) -> dict[str, Any]:
+        pending_archives = self.list_pending_archives(pending_dir)
+        state = self.get_job_status()
+        return {
+            **state,
+            "queue_pending": len(pending_archives),
+            "queue_total": state["current_archive_total"] if state["running"] else len(pending_archives),
+            "latest_zip": pending_archives[0].name if pending_archives else "",
+        }
 
     def list_archive_members(self, archive_path: Path) -> List[str]:
         archive_path = Path(archive_path)
@@ -126,7 +267,7 @@ class IngestionService:
 
     def _handle_cancelled_run(
         self,
-        progress_cb: Optional[Callable[[float, str], None]] = None,
+        progress_cb: Optional[ProgressCallback] = None,
         extract_to: Optional[Path] = None,
         remove_extract_dir: bool = False,
     ) -> bool:
@@ -139,6 +280,7 @@ class IngestionService:
             except Exception as exc:
                 logger.debug(f"Failed to clean partial extract directory {extract_to}: {exc}")
 
+        self._update_job_status(running=False, current_step="Import cancelled.")
         if progress_cb:
             progress_cb(0.0, "Import cancelled.")
 
@@ -146,7 +288,7 @@ class IngestionService:
 
     def _maybe_emit_progress(
         self,
-        progress_cb: Optional[Callable[[float, str], None]],
+        progress_cb: Optional[ProgressCallback],
         start: float,
         end: float,
         processed: int,
@@ -196,28 +338,152 @@ class IngestionService:
             return False
         return True
 
+    def _prepare_clean_directory(self, path: Path) -> None:
+        path = Path(path)
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True, exist_ok=True)
+
+    def _move_to_bucket(self, source: Path, target_dir: Path) -> Path:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        destination = target_dir / source.name
+        if not destination.exists():
+            return source.replace(destination)
+
+        counter = 1
+        while True:
+            candidate = target_dir / f"{source.stem}-{counter}{source.suffix}"
+            if not candidate.exists():
+                return source.replace(candidate)
+            counter += 1
+
+    def process_pending_queue(
+        self,
+        pending_dir: Path,
+        extracted_dir: Path,
+        processed_dir: Path,
+        failed_dir: Path,
+        progress_cb: Optional[ProgressCallback] = None,
+    ) -> dict[str, Any]:
+        pending_dir = Path(pending_dir)
+        extracted_dir = Path(extracted_dir)
+        processed_dir = Path(processed_dir)
+        failed_dir = Path(failed_dir)
+
+        self._reset_job_flags()
+        self._reset_job_status()
+        archives = self.list_pending_archives(pending_dir)
+        total_archives = len(archives)
+        if total_archives == 0:
+            return {
+                "success": True,
+                "cancelled": False,
+                "total_archives": 0,
+                "processed_archives": 0,
+                "failed_archives": 0,
+                "results": [],
+            }
+
+        processed_count = 0
+        failed_count = 0
+        results: list[dict[str, Any]] = []
+        self._update_job_status(
+            running=True,
+            current_step="Preparing batch...",
+            current_archive_total=total_archives,
+        )
+
+        try:
+            for index, archive_path in enumerate(archives, start=1):
+                self._raise_if_cancelled()
+                self._prepare_clean_directory(extracted_dir)
+                self._update_job_status(
+                    current_archive=archive_path.name,
+                    current_archive_index=index,
+                    current_archive_total=total_archives,
+                    current_step=f"Processing archive {index} of {total_archives}",
+                    overall_progress=(index - 1) / total_archives,
+                    download_total=0,
+                    download_completed=0,
+                    download_skipped=0,
+                    download_failed=0,
+                )
+
+                def archive_progress(progress: float, message: str) -> None:
+                    overall = ((index - 1) + progress) / total_archives
+                    step_message = f"Processing archive {index} of {total_archives}: {message}"
+                    self._update_job_status(
+                        current_archive=archive_path.name,
+                        current_archive_index=index,
+                        current_archive_total=total_archives,
+                        current_step=step_message,
+                        overall_progress=min(overall, 1.0),
+                    )
+                    if progress_cb:
+                        progress_cb(min(overall, 1.0), step_message)
+
+                success = self.process_archive(archive_path, extracted_dir, archive_progress)
+                moved_to = self._move_to_bucket(
+                    archive_path,
+                    processed_dir if success else failed_dir,
+                )
+                results.append(
+                    {
+                        "archive": archive_path.name,
+                        "success": bool(success),
+                        "destination": str(moved_to),
+                    }
+                )
+                if success:
+                    processed_count += 1
+                else:
+                    failed_count += 1
+                self._prepare_clean_directory(extracted_dir)
+                if self.was_cancelled():
+                    break
+        finally:
+            self._prepare_clean_directory(extracted_dir)
+            self._update_job_status(
+                running=False,
+                overall_progress=0.0 if self.was_cancelled() else (1.0 if total_archives else 0.0),
+                current_step="Import cancelled." if self.was_cancelled() else "Idle",
+            )
+
+        return {
+            "success": failed_count == 0 and not self.was_cancelled(),
+            "cancelled": self.was_cancelled(),
+            "total_archives": total_archives,
+            "processed_archives": processed_count,
+            "failed_archives": failed_count,
+            "results": results,
+        }
+
     def process_archive(
         self,
         archive_path: Path,
         extract_to: Path,
-        progress_cb: Callable[[float, str], None],
+        progress_cb: ProgressCallback,
     ):
         archive_path = Path(archive_path)
         extract_to = Path(extract_to)
-        created_extract_dir = not extract_to.exists()
-        self._reset_job_flags()
         self._reset_runtime_state()
 
         try:
             self._raise_if_cancelled()
-            progress_cb(0.0, "Checking disk space...")
+            progress_cb(0.02, "Checking disk space...")
             if not self._has_enough_space(archive_path, extract_to):
                 logger.error("Insufficient disk space.")
                 progress_cb(0.0, "Error: Not enough disk space!")
                 return False
 
-            progress_cb(0.1, "Extracting & Merging...")
-            self._smart_extract(archive_path, extract_to, progress_cb, start=0.1, end=0.2)
+            progress_cb(0.08, "Extracting archive...")
+            self._smart_extract(archive_path, extract_to, progress_cb, start=0.08, end=0.20)
+
+            progress_cb(0.20, "Inspecting memories metadata...")
+            self._download_memories_from_history(extract_to, progress_cb, start=0.20, end=0.32)
+
+            progress_cb(0.32, "Staging physical media...")
+            self._copy_extracted_media_to_raw(extract_to, progress_cb, start=0.32, end=0.38)
 
             return self.process_folder(
                 extract_to,
@@ -229,7 +495,7 @@ class IngestionService:
             return self._handle_cancelled_run(
                 progress_cb,
                 extract_to=extract_to,
-                remove_extract_dir=created_extract_dir,
+                remove_extract_dir=True,
             )
         except Exception as e:
             logger.error(f"Archive ingestion failed: {e}")
@@ -237,7 +503,6 @@ class IngestionService:
             return False
         finally:
             self._reset_runtime_state()
-            self._cancel_requested.clear()
 
     def process_zip(self, zip_path: Path, extract_to: Path, progress_cb: Callable[[float, str], None]):
         return self.process_archive(zip_path, extract_to, progress_cb)
@@ -388,10 +653,7 @@ class IngestionService:
             progress_cb(end, "Extracting & Merging...")
 
     def _should_extract_member(self, target: Path) -> bool:
-        is_media = target.suffix.lower() in ['.jpg', '.jpeg', '.png', '.mp4', '.mov', '.avi', '.webm', '.m4a']
-        if is_media and target.exists():
-            return False
-        return True
+        return not target.exists()
 
     def _extract_members(
         self,
@@ -441,10 +703,255 @@ class IngestionService:
         if progress_cb:
             progress_cb(end, "Extracting & Merging...")
 
+    def _memory_json_path(self, root: Path) -> Optional[Path]:
+        for candidate in (root / "json" / "memories_history.json", root / "memories_history.json"):
+            if candidate.exists():
+                return candidate
+        return None
+
+    @staticmethod
+    def _extract_mid_from_url(url: str) -> Optional[str]:
+        if not url:
+            return None
+        try:
+            params = parse_qs(urlparse(url).query)
+        except Exception:
+            return None
+        values = params.get("mid")
+        if not values:
+            return None
+        candidate = values[0].strip()
+        return candidate or None
+
+    @staticmethod
+    def _safe_iso_date(raw_date: str) -> Optional[str]:
+        if not raw_date:
+            return None
+        try:
+            return datetime.fromisoformat(raw_date.replace(" UTC", "")).strftime("%Y-%m-%d")
+        except Exception:
+            return raw_date[:10] if len(raw_date) >= 10 else None
+
+    @classmethod
+    def build_memory_download_name(
+        cls,
+        item: dict[str, Any],
+        content_type: Optional[str] = None,
+    ) -> Optional[str]:
+        url = str(item.get("Media Download Url") or item.get("Download Link") or "").strip()
+        mid = cls._extract_mid_from_url(url)
+        date_part = cls._safe_iso_date(str(item.get("Date") or "").strip())
+        if not mid or not date_part:
+            return None
+
+        extension = None
+        if content_type:
+            extension = _MEMORY_CONTENT_TYPE_EXTENSIONS.get(
+                content_type.split(";", 1)[0].strip().lower()
+            )
+        if not extension:
+            media_type = str(item.get("Media Type") or "").strip().lower()
+            if media_type == "video":
+                extension = ".mp4"
+            elif media_type == "image":
+                extension = ".jpg"
+        if not extension:
+            extension = mimetypes.guess_extension(content_type or "") if content_type else None
+        if not extension:
+            extension = ".bin"
+        return f"{date_part}_{mid}-main{extension}"
+
+    def _download_memories_from_history(
+        self,
+        extracted_root: Path,
+        progress_cb: Optional[ProgressCallback],
+        start: float,
+        end: float,
+    ) -> None:
+        json_path = self._memory_json_path(extracted_root)
+        if not json_path or not json_path.exists():
+            self._update_job_status(
+                download_total=0,
+                download_completed=0,
+                download_skipped=0,
+                download_failed=0,
+            )
+            if progress_cb:
+                progress_cb(end, "No memories download metadata found.")
+            return
+
+        try:
+            payload = self._load_json_file(json_path)
+        except Exception as exc:
+            logger.debug(f"Failed to read memories download metadata from {json_path}: {exc}")
+            if progress_cb:
+                progress_cb(end, "Skipping memories download metadata.")
+            return
+
+        saved_media = payload.get("Saved Media", []) if isinstance(payload, dict) else []
+        if not isinstance(saved_media, list):
+            if progress_cb:
+                progress_cb(end, "Skipping malformed memories metadata.")
+            return
+
+        extracted_memories_dir = extracted_root / "memories"
+        raw_memories_dir = get_raw_media_dir() / "memories"
+        extracted_memories_dir.mkdir(parents=True, exist_ok=True)
+        raw_memories_dir.mkdir(parents=True, exist_ok=True)
+
+        download_jobs: list[tuple[str, Path, dict[str, Any]]] = []
+        skipped = 0
+        total_candidates = 0
+        for item in saved_media:
+            self._raise_if_cancelled()
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("Media Download Url") or item.get("Download Link") or "").strip()
+            if not url:
+                continue
+            filename = self.build_memory_download_name(item)
+            if not filename:
+                continue
+            total_candidates += 1
+            raw_target = raw_memories_dir / filename
+            extract_target = extracted_memories_dir / filename
+            if raw_target.exists() or extract_target.exists():
+                skipped += 1
+                continue
+            download_jobs.append((url, extract_target, item))
+
+        self._update_job_status(
+            download_total=total_candidates,
+            download_completed=0,
+            download_skipped=skipped,
+            download_failed=0,
+        )
+        if total_candidates == 0:
+            if progress_cb:
+                progress_cb(end, "No memories downloads needed.")
+            return
+
+        completed = 0
+        failed = 0
+        processed = skipped
+        last_emit = start
+        if progress_cb:
+            progress_cb(start, "Downloading memories...")
+
+        def worker(url: str, destination: Path, item: dict[str, Any]) -> tuple[bool, Path]:
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            try:
+                with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                    response = client.get(url)
+                if response.status_code in {403, 404}:
+                    return False, destination
+                response.raise_for_status()
+                resolved_name = self.build_memory_download_name(
+                    item,
+                    content_type=response.headers.get("content-type"),
+                )
+                if resolved_name:
+                    destination = destination.with_name(resolved_name)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with open(destination, "wb") as handle:
+                    handle.write(response.content)
+                return True, destination
+            except (httpx.HTTPError, OSError) as exc:
+                logger.debug(f"Failed to download memory {url}: {exc}")
+                return False, destination
+
+        if download_jobs:
+            with ThreadPoolExecutor(max_workers=min(8, max(len(download_jobs), 1))) as executor:
+                futures = [
+                    executor.submit(worker, url, destination, item)
+                    for url, destination, item in download_jobs
+                ]
+                for future in as_completed(futures):
+                    self._raise_if_cancelled()
+                    success, _ = future.result()
+                    processed += 1
+                    if success:
+                        completed += 1
+                    else:
+                        failed += 1
+                    self._update_job_status(
+                        download_total=total_candidates,
+                        download_completed=completed,
+                        download_skipped=skipped,
+                        download_failed=failed,
+                    )
+                    last_emit = self._maybe_emit_progress(
+                        progress_cb,
+                        start,
+                        end,
+                        processed,
+                        total_candidates,
+                        "Downloading memories...",
+                        last_emit,
+                    )
+
+        if progress_cb:
+            progress_cb(end, "Downloading memories...")
+
+    def _copy_extracted_media_to_raw(
+        self,
+        extracted_root: Path,
+        progress_cb: Optional[ProgressCallback],
+        start: float,
+        end: float,
+    ) -> None:
+        raw_root = get_raw_media_dir()
+        candidates: list[Path] = []
+        for folder_name in ("chat_media", "memories"):
+            source_dir = extracted_root / folder_name
+            if source_dir.exists():
+                candidates.extend(path for path in source_dir.rglob("*") if path.is_file())
+
+        total = len(candidates)
+        if total == 0:
+            if progress_cb:
+                progress_cb(end, "No physical media to stage.")
+            return
+
+        processed = 0
+        last_emit = start
+        if progress_cb:
+            progress_cb(start, "Staging physical media...")
+        for source_file in candidates:
+            self._raise_if_cancelled()
+            relative = source_file.relative_to(extracted_root)
+            destination = raw_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists():
+                try:
+                    shutil.copy2(source_file, destination)
+                except Exception as exc:
+                    logger.debug(f"Failed to copy media {source_file} to {destination}: {exc}")
+            processed += 1
+            last_emit = self._maybe_emit_progress(
+                progress_cb,
+                start,
+                end,
+                processed,
+                total,
+                "Staging physical media...",
+                last_emit,
+            )
+
+        if progress_cb:
+            progress_cb(end, "Staging physical media...")
+
+    def _has_staged_metadata(self) -> bool:
+        staged_dir = self._get_staged_dir()
+        return any(
+            (staged_dir / filename).exists()
+            for filename in ("chat_history.json", "snap_history.json", "memories_history.json")
+        )
+
     def process_folder(
         self,
         folder_path: Path,
-        progress_cb: Callable[[float, str], None],
+        progress_cb: ProgressCallback,
         skip_extract: bool = False,
         reset_cancel_state: bool = True,
     ):
@@ -455,36 +962,40 @@ class IngestionService:
         try:
             folder_path = Path(folder_path)
             self._raise_if_cancelled()
-            if not skip_extract: progress_cb(0.1, "Verifying folder...")
+            if not skip_extract:
+                progress_cb(0.02, "Verifying folder...")
             self.current_root = self._find_snap_root(folder_path)
-            if not self.contains_export_markers(self.current_root):
-                raise ValueError(f"No Snapchat export markers found in {self.current_root}.")
-            logger.info(f"Root detected at: {self.current_root}")
-            self.db.set_config("root_path", str(self.current_root.absolute()))
             self.media_match_mode = (self.db.get_config("media_match_mode") or "strict").lower()
+            has_new_metadata = self.contains_export_markers(self.current_root)
 
-            progress_cb(0.2, "Staging Data...")
-            self._create_staging_environment()
+            if has_new_metadata:
+                logger.info(f"Root detected at: {self.current_root}")
+                self.db.set_config("root_path", str(self.current_root.absolute()))
+                progress_cb(0.40, "Staging metadata...")
+                self._create_staging_environment()
+            elif not self._has_staged_metadata():
+                raise ValueError("No staged metadata found. Import a base archive with JSON first.")
+            else:
+                progress_cb(0.40, "Reusing staged metadata...")
 
-            progress_cb(0.25, "Indexing Media...")
-            self._index_and_bucket_media(self.current_root, progress_cb, start=0.25, end=0.6)
+            progress_cb(0.48, "Indexing media...")
+            self._index_and_bucket_media(get_raw_media_dir(), progress_cb, start=0.48, end=0.78)
 
-            progress_cb(0.62, "Identifying User...")
+            progress_cb(0.80, "Identifying user...")
             self._parse_account_info()
 
-            progress_cb(0.64, "Refreshing Messages...")
-            self._reset_messages_for_import()
-
-            progress_cb(0.65, "Parsing Chats...")
-            self._parse_chats(progress_cb, start=0.65, end=0.85)
-            self._parse_snap_history(progress_cb, start=0.85, end=0.95)
+            progress_cb(0.82, "Parsing chats...")
+            self._parse_chats(progress_cb, start=0.82, end=0.92)
+            self._parse_snap_history(progress_cb, start=0.92, end=0.99)
 
             progress_cb(1.0, "Complete!")
+            self.db.set_config("last_ingested_at", datetime.now(UTC).isoformat())
             return True
         except IngestionCancelled:
             return self._handle_cancelled_run(progress_cb)
         except Exception as e:
             logger.error(f"Folder ingestion failed: {e}")
+            progress_cb(0.0, f"Error: {e}")
             return False
         finally:
             self._reset_runtime_state()
@@ -493,38 +1004,23 @@ class IngestionService:
 
     def rebuild_chat_media_links(
         self,
-        progress_cb: Optional[Callable[[float, str], None]] = None
+        progress_cb: Optional[ProgressCallback] = None
     ) -> bool:
         try:
-            root_path = self.db.get_config("root_path")
-            if not root_path:
+            if not self._has_staged_metadata():
                 if progress_cb:
-                    progress_cb(0.0, "Error: No root folder configured.")
-                return False
-
-            self.current_root = Path(root_path)
-            if not self.current_root.exists():
-                if progress_cb:
-                    progress_cb(0.0, "Error: Root folder missing.")
+                    progress_cb(0.0, "Error: No staged metadata found.")
                 return False
 
             self.media_match_mode = (self.db.get_config("media_match_mode") or "strict").lower()
 
             if progress_cb:
-                progress_cb(0.05, "Preparing rebuild...")
-
-            self._create_staging_environment()
-
-            if progress_cb:
-                progress_cb(0.2, "Indexing Media...")
-            self._index_and_bucket_media(self.current_root, progress_cb, start=0.2, end=0.6)
-
-            if progress_cb:
-                progress_cb(0.62, "Rebuilding chat links...")
+                progress_cb(0.20, "Indexing media...")
+            self._index_and_bucket_media(get_raw_media_dir(), progress_cb, start=0.20, end=0.70)
 
             self.db.clear_messages()
-            self._parse_chats(progress_cb, start=0.65, end=0.85)
-            self._parse_snap_history(progress_cb, start=0.85, end=0.98)
+            self._parse_chats(progress_cb, start=0.72, end=0.88)
+            self._parse_snap_history(progress_cb, start=0.88, end=1.0)
 
             if progress_cb:
                 progress_cb(1.0, "Rebuild Complete!")
@@ -566,6 +1062,15 @@ class IngestionService:
                 try: shutil.copy2(src, staged_dir / fname)
                 except Exception as e: logger.error(f"Failed to stage {fname}: {e}")
 
+    @staticmethod
+    def _chat_message_signature(message: dict[str, Any]) -> str:
+        sender = str(message.get("From") or "")
+        created = str(message.get("Created") or "")
+        msg_type = str(message.get("Media Type") or "")
+        content = "" if message.get("Content") is None else str(message.get("Content"))
+        media_ids = str(message.get("Media IDs") or "")
+        return "|".join([sender, created, msg_type, content, media_ids])
+
     def _merge_chats_to_stage(self, staged_dir: Path):
         self._raise_if_cancelled()
         staged_file = staged_dir / "chat_history.json"
@@ -587,17 +1092,30 @@ class IngestionService:
             new_chats = self._parse_html_directory(html_src)
         for user_key, messages in new_chats.items():
             self._raise_if_cancelled()
-            if user_key not in master_chats:
-                master_chats[user_key] = messages
-            else:
-                existing_sigs = {f"{m.get('Created')}_{m.get('Content')}" for m in master_chats[user_key]}
-                for msg in messages:
-                    sig = f"{msg.get('Created')}_{msg.get('Content')}"
-                    if sig not in existing_sigs:
-                        master_chats[user_key].append(msg)
-                        existing_sigs.add(sig)
+            if not isinstance(messages, list):
+                continue
+            master_chats.setdefault(user_key, [])
+            existing_sigs = {
+                self._chat_message_signature(msg)
+                for msg in master_chats[user_key]
+                if isinstance(msg, dict)
+            }
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                sig = self._chat_message_signature(msg)
+                if sig not in existing_sigs:
+                    master_chats[user_key].append(msg)
+                    existing_sigs.add(sig)
         with open(staged_file, "w", encoding="utf-8") as f:
             json.dump(master_chats, f, indent=4)
+
+    def _memory_entry_signature(self, item: dict[str, Any]) -> str:
+        url = str(item.get("Media Download Url") or item.get("Download Link") or "").strip()
+        mid = self._extract_mid_from_url(url)
+        if mid:
+            return f"mid:{mid}"
+        return f"fallback:{item.get('Date', '')}|{url}"
 
     def _merge_memories_to_stage(self, staged_dir: Path):
         self._raise_if_cancelled()
@@ -608,17 +1126,29 @@ class IngestionService:
                 with open(staged_file, "r", encoding="utf-8") as f: master_mems = json.load(f)
             except Exception as exc:
                 logger.debug(f"Failed to read staged memories history: {exc}")
-        json_src = self.current_root / "json" / "memories_history.json"
-        if not json_src.exists(): json_src = self.current_root / "memories_history.json"
-        if json_src.exists():
+        if not isinstance(master_mems, dict):
+            master_mems = {"Saved Media": []}
+        if not isinstance(master_mems.get("Saved Media"), list):
+            master_mems["Saved Media"] = []
+
+        json_src = self._memory_json_path(self.current_root)
+        if json_src and json_src.exists():
             try:
                 with open(json_src, "r", encoding="utf-8") as f:
                     new_data = json.load(f)
-                existing_dates = {m.get("Date") for m in master_mems.get("Saved Media", [])}
+                existing_entries = {
+                    self._memory_entry_signature(item)
+                    for item in master_mems.get("Saved Media", [])
+                    if isinstance(item, dict)
+                }
                 for item in new_data.get("Saved Media", []):
                     self._raise_if_cancelled()
-                    if item.get("Date") not in existing_dates:
+                    if not isinstance(item, dict):
+                        continue
+                    signature = self._memory_entry_signature(item)
+                    if signature not in existing_entries:
                         master_mems["Saved Media"].append(item)
+                        existing_entries.add(signature)
                 with open(staged_file, "w", encoding="utf-8") as f:
                     json.dump(master_mems, f, indent=4)
             except Exception as exc:
@@ -658,7 +1188,7 @@ class IngestionService:
     def _index_and_bucket_media(
         self,
         root: Path,
-        progress_cb: Optional[Callable[[float, str], None]] = None,
+        progress_cb: Optional[ProgressCallback] = None,
         start: float = 0.0,
         end: float = 1.0
     ):
@@ -666,7 +1196,7 @@ class IngestionService:
         self.media_id_map = {}
         media_folders = [root / "chat_media", root / "memories"]
         date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
-        video_exts = {".mp4", ".mov", ".avi", ".webm"}
+        video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
 
         def extract_media_id(stem_id: str) -> Optional[str]:
             parts = stem_id.split("_", 1)
@@ -680,27 +1210,24 @@ class IngestionService:
             return id_part
         
         def get_stem_id(path: Path) -> str:
-            name = path.stem
-            suffixes = ["_overlay", "_caption", "_image", "_video", "_media", "_main"]
-            for suffix in suffixes:
-                if name.endswith(suffix):
-                    return name[:-len(suffix)]
-            return name
+            return normalize_media_stem(path.stem)
 
         def is_video(path: Path) -> bool:
             return path.suffix.lower() in video_exts
 
         def main_rank(path: Path) -> int:
-            stem = path.stem
+            stem = path.stem.lower()
+            if "_media~" in stem.lower():
+                return 0
             if is_video(path):
-                if stem.endswith("_video"):
+                if stem.endswith(("_video", "-video")):
                     return 0
             else:
-                if stem.endswith("_image"):
+                if stem.endswith(("_image", "-image")):
                     return 0
-            if stem.endswith("_main"):
+            if stem.endswith(("_main", "-main")):
                 return 1
-            if stem.endswith("_media"):
+            if stem.endswith(("_media", "-media")):
                 return 2
             return 3
 
@@ -734,7 +1261,7 @@ class IngestionService:
                     if stem_id not in groups:
                         groups[stem_id] = {"main": None, "overlay": None, "ts": None}
                     
-                    is_overlay_file = file.stem.endswith(("_overlay", "_caption"))
+                    is_overlay_file = is_overlay_variant(file)
                     
                     if is_overlay_file:
                         groups[stem_id]["overlay"] = file
@@ -777,7 +1304,7 @@ class IngestionService:
                     continue
 
                 batch.append(MediaAsset(
-                    asset_id=stem_id,
+                    asset_id=f"{folder.name}:{stem_id}",
                     file_path=str(main_file.absolute()),
                     file_type=ftype,
                     file_size=file_size,
@@ -843,6 +1370,7 @@ class IngestionService:
         
         if username:
             self.db.set_config("owner_username", username)
+            self.db.upsert_user(username, display_name)
             if display_name: self.db.set_config("owner_display_name", display_name)
 
     def _collect_conversation_ids(self, payload: Any) -> set[str]:

@@ -15,6 +15,8 @@ def _normalize_path_value(value: str | Path) -> str:
 
 
 def _safe_relative_path(file_path: str | Path, root: Path) -> Optional[str]:
+    if file_path is None:
+        return None
     normalized_path = _normalize_path_value(file_path).strip()
     normalized_root = _normalize_path_value(root.resolve()).rstrip("/")
     if not normalized_path:
@@ -65,11 +67,15 @@ def build_media_url(request: Request, file_path: str | Path | None) -> str | Non
 def ensure_thumbnail_url(
     request: Request,
     processor: MediaProcessor,
-    file_path: str | Path,
+    file_path: str | Path | None,
     overlay_path: str | Path | None = None,
     size: tuple[int, int] = (400, 400),
 ) -> str | None:
+    if not file_path:
+        return None
     target = Path(resolve_preferred_media_path(str(file_path)))
+    if not target.exists():
+        return None
     overlay = Path(overlay_path) if overlay_path else None
 
     thumbnail_path = processor.get_thumbnail_sync(
@@ -82,12 +88,14 @@ def ensure_thumbnail_url(
     return build_media_url(request, thumbnail_path)
 
 
-def resolve_overlay_path(file_path: str | Path, overlay_path: str | Path | None) -> str | None:
+def resolve_overlay_path(file_path: str | Path | None, overlay_path: str | Path | None) -> str | None:
     if overlay_path:
         overlay_candidate = Path(str(overlay_path))
         if overlay_candidate.exists():
             return _normalize_path_value(overlay_candidate)
 
+    if not file_path:
+        return None
     preferred_media_path = resolve_preferred_media_path(str(file_path))
     derived_overlay = find_caption_overlay(preferred_media_path)
     return _normalize_path_value(derived_overlay) if derived_overlay else None

@@ -1,5 +1,8 @@
 services:
   snapcapsule-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: ghcr.io/s0up12/snapcapsule-backend:latest
     container_name: snapcapsule-backend
     ports:
@@ -9,12 +12,17 @@ services:
       SNAPCAPSULE_DATABASE_DIR: /data/database
       SNAPCAPSULE_CACHE_DIR: /data/cache
       SNAPCAPSULE_IMPORTS_DIR: /data/imports
+      SNAPCAPSULE_RAW_MEDIA_DIR: /data/raw_media
     volumes:
       - ${DATABASE_DIR:-./data/database}:/data/database
       - ${CACHE_DIR:-./data/cache}:/data/cache
       - ${IMPORTS_DIR:-./data/imports}:/data/imports
+      - ${RAW_MEDIA_DIR:-./data/raw_media}:/data/raw_media
     restart: unless-stopped
   snapcapsule-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     image: ghcr.io/s0up12/snapcapsule-frontend:latest
     container_name: snapcapsule-frontend
     depends_on:
