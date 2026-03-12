@@ -1,5 +1,5 @@
 import { Clapperboard, X } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 type LightboxProps = {
   mediaUrl: string | null;
@@ -16,6 +16,9 @@ export default function Lightbox({
   title,
   onClose,
 }: LightboxProps) {
+  const [mediaFailed, setMediaFailed] = useState(false);
+  const [overlayFailed, setOverlayFailed] = useState(false);
+
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -32,6 +35,11 @@ export default function Lightbox({
       window.removeEventListener("keydown", handleEscape);
     };
   }, [onClose]);
+
+  useEffect(() => {
+    setMediaFailed(false);
+    setOverlayFailed(false);
+  }, [mediaUrl, overlayUrl, isVideo]);
 
   return (
     <div
@@ -70,7 +78,7 @@ export default function Lightbox({
               </div>
             ) : null}
 
-            {mediaUrl ? (
+            {mediaUrl && !mediaFailed ? (
               <div className="relative w-full h-full max-h-[90vh] max-w-[90vw]">
                 {isVideo ? (
                   <video
@@ -78,21 +86,24 @@ export default function Lightbox({
                     controls
                     playsInline
                     autoPlay
+                    onError={() => setMediaFailed(true)}
                     className="absolute inset-0 w-full h-full object-contain"
                   />
                 ) : (
                   <img
                     src={mediaUrl}
                     alt={title || "Media"}
+                    onError={() => setMediaFailed(true)}
                     className="absolute inset-0 w-full h-full object-contain"
                   />
                 )}
 
-                {overlayUrl ? (
+                {overlayUrl && !overlayFailed ? (
                   <img
                     src={overlayUrl}
                     alt=""
                     aria-hidden="true"
+                    onError={() => setOverlayFailed(true)}
                     className="absolute inset-0 w-full h-full object-contain pointer-events-none"
                   />
                 ) : null}

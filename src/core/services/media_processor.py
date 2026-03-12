@@ -16,6 +16,44 @@ from core.utils.media_paths import resolve_preferred_media_path
 logger = get_logger("MediaProcessor")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
 
+
+def _normalize_overlay_path(overlay_path: Optional[str | Path]) -> Optional[str]:
+    if not overlay_path:
+        return None
+    try:
+        return str(Path(overlay_path).absolute())
+    except Exception:
+        return str(overlay_path)
+
+
+def build_thumbnail_cache_path(
+    cache_dir: Path,
+    file_path: Path,
+    size: Tuple[int, int],
+    crop: bool,
+    overlay_path: Optional[str | Path] = None,
+) -> Path:
+    mode = "crop" if crop else "fit"
+    overlay_str = _normalize_overlay_path(overlay_path)
+    overlay_sig = (
+        f"_overlay_{hashlib.md5(overlay_str.encode('utf-8', errors='ignore')).hexdigest()}"
+        if overlay_str
+        else ""
+    )
+    unique_str = f"{file_path.absolute()}_{size[0]}x{size[1]}_{mode}{overlay_sig}"
+    hash_name = hashlib.md5(unique_str.encode()).hexdigest()
+    return cache_dir / f"{hash_name}.jpg"
+
+
+def build_web_video_cache_path(cache_dir: Path, file_path: Path) -> Path:
+    try:
+        stats = file_path.stat()
+        fingerprint = f"{file_path.absolute()}_{stats.st_mtime_ns}_{stats.st_size}"
+    except Exception:
+        fingerprint = str(file_path.absolute())
+    hash_name = hashlib.md5(fingerprint.encode()).hexdigest()
+    return cache_dir / "web" / f"{hash_name}_web.mp4"
+
 @contextmanager
 def suppress_c_stderr():
     """
@@ -49,15 +87,19 @@ def suppress_c_stderr():
         yield
 
 class MediaProcessor:
-    def __init__(self, cache_dir: Path, max_workers: int = 4):
+    def __init__(self, cache_dir: Path, max_workers: int | None = None):
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if max_workers is None:
+            cpu_count = os.cpu_count() or 1
+            max_workers = max(1, min(2, cpu_count // 2 or 1))
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
         # Cache for failed files to prevent CPU loops
         self.failed_cache = set()
         self.transcode_failed_cache = set()
         self._failed_lock = threading.Lock()
+        self._thumbnail_futures: dict[str, Future[bool]] = {}
         self._transcode_futures: dict[str, Future[bool]] = {}
 
     def clear_cache(self):
@@ -66,6 +108,9 @@ class MediaProcessor:
             # Clear memory cache
             with self._failed_lock:
                 self.failed_cache.clear()
+                self.transcode_failed_cache.clear()
+                self._thumbnail_futures.clear()
+                self._transcode_futures.clear()
             
             # Clear disk cache
             if self.cache_dir.exists():
@@ -75,21 +120,29 @@ class MediaProcessor:
         except Exception as e:
             logger.error(f"Failed to clear cache: {e}")
 
+    @staticmethod
+    def _prepare_media_path(
+        file_path: Path | None,
+        resolve_variants: bool = True,
+    ) -> Path | None:
+        if not file_path:
+            return None
+
+        try:
+            candidate = Path(file_path)
+        except Exception:
+            return None
+
+        if resolve_variants:
+            candidate = Path(resolve_preferred_media_path(str(candidate)))
+
+        return candidate
+
     def get_cache_path(self, file_path: Path, size: Tuple[int, int], crop: bool, overlay_path: Optional[str] = None) -> Path:
-        mode = "crop" if crop else "fit"
-        overlay_sig = f"_overlay_{hashlib.md5(overlay_path.encode('utf-8', errors='ignore')).hexdigest()}" if overlay_path else ""
-        unique_str = f"{file_path.absolute()}_{size[0]}x{size[1]}_{mode}{overlay_sig}"
-        hash_name = hashlib.md5(unique_str.encode()).hexdigest()
-        return self.cache_dir / f"{hash_name}.jpg"
+        return build_thumbnail_cache_path(self.cache_dir, file_path, size, crop, overlay_path)
 
     def get_web_video_path(self, file_path: Path) -> Path:
-        try:
-            stats = file_path.stat()
-            fingerprint = f"{file_path.absolute()}_{stats.st_mtime_ns}_{stats.st_size}"
-        except Exception:
-            fingerprint = str(file_path.absolute())
-        hash_name = hashlib.md5(fingerprint.encode()).hexdigest()
-        return self.cache_dir / "web" / f"{hash_name}_web.mp4"
+        return build_web_video_cache_path(self.cache_dir, file_path)
 
     @staticmethod
     def _transcode_video_for_web(input_path: str, output_path: str) -> bool:
@@ -105,6 +158,8 @@ class MediaProcessor:
                 "-y",
                 "-i",
                 input_path,
+                "-threads",
+                "1",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -268,6 +323,158 @@ class MediaProcessor:
         with self._failed_lock:
             self.failed_cache.add(path_str)
         return None
+
+    def _finalize_thumbnail_future(
+        self,
+        cache_key: str,
+        source_key: str,
+        future: Future[bool],
+    ) -> None:
+        try:
+            success = bool(future.result())
+        except Exception:
+            success = False
+
+        with self._failed_lock:
+            current_future = self._thumbnail_futures.get(cache_key)
+            if current_future is future and future.done():
+                self._thumbnail_futures.pop(cache_key, None)
+            if success:
+                self.failed_cache.discard(source_key)
+            else:
+                self.failed_cache.add(source_key)
+
+    def _finalize_transcode_future(
+        self,
+        source_key: str,
+        future: Future[bool],
+    ) -> None:
+        try:
+            success = bool(future.result())
+        except Exception:
+            success = False
+
+        with self._failed_lock:
+            current_future = self._transcode_futures.get(source_key)
+            if current_future is future and future.done():
+                self._transcode_futures.pop(source_key, None)
+            if success:
+                self.transcode_failed_cache.discard(source_key)
+            else:
+                self.transcode_failed_cache.add(source_key)
+
+    def queue_thumbnail(
+        self,
+        file_path: Path | None,
+        size: Tuple[int, int] = (400, 400),
+        crop: bool = False,
+        overlay_path: Optional[Path] = None,
+        resolve_variants: bool = True,
+    ) -> None:
+        resolved_path = self._prepare_media_path(file_path, resolve_variants=resolve_variants)
+        if resolved_path is None:
+            return
+        if not resolved_path.exists():
+            return
+
+        source_key = str(resolved_path.absolute())
+        with self._failed_lock:
+            if source_key in self.failed_cache:
+                return
+
+        overlay_str = None
+        if overlay_path and overlay_path.exists():
+            overlay_str = str(overlay_path.absolute())
+
+        cache_path = self.get_cache_path(resolved_path, size, crop, overlay_str)
+        try:
+            if cache_path.exists() and cache_path.stat().st_size > 0:
+                return
+        except Exception:
+            pass
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_key = str(cache_path.absolute())
+
+        with self._failed_lock:
+            existing_future = self._thumbnail_futures.get(cache_key)
+            if existing_future is not None and not existing_future.done():
+                return
+            future = self.executor.submit(
+                self._generate_thumbnail,
+                source_key,
+                str(cache_path),
+                size,
+                crop,
+                overlay_str,
+            )
+            self._thumbnail_futures[cache_key] = future
+
+        future.add_done_callback(
+            lambda completed_future, ck=cache_key, sk=source_key: self._finalize_thumbnail_future(
+                ck,
+                sk,
+                completed_future,
+            )
+        )
+
+    def queue_web_media(self, file_path: Path | None, resolve_variants: bool = True) -> None:
+        resolved_path = self._prepare_media_path(file_path, resolve_variants=resolve_variants)
+        if resolved_path is None:
+            return
+        if resolved_path.suffix.lower() not in VIDEO_EXTENSIONS or not resolved_path.exists():
+            return
+
+        source_key = str(resolved_path.absolute())
+        with self._failed_lock:
+            if source_key in self.transcode_failed_cache:
+                return
+
+        web_path = self.get_web_video_path(resolved_path)
+        try:
+            if web_path.exists() and web_path.stat().st_size > 0:
+                return
+        except Exception:
+            pass
+
+        web_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with self._failed_lock:
+            existing_future = self._transcode_futures.get(source_key)
+            if existing_future is not None and not existing_future.done():
+                return
+            future = self.executor.submit(
+                self._transcode_video_for_web,
+                source_key,
+                str(web_path),
+            )
+            self._transcode_futures[source_key] = future
+
+        future.add_done_callback(
+            lambda completed_future, sk=source_key: self._finalize_transcode_future(
+                sk,
+                completed_future,
+            )
+        )
+
+    def queue_precompute(
+        self,
+        file_path: Path | None,
+        overlay_path: Optional[Path] = None,
+        size: Tuple[int, int] = (400, 400),
+        crop: bool = False,
+        resolve_variants: bool = True,
+    ) -> None:
+        if not file_path:
+            return
+        self.queue_thumbnail(
+            file_path,
+            size=size,
+            crop=crop,
+            overlay_path=overlay_path,
+            resolve_variants=resolve_variants,
+        )
+        self.queue_web_media(file_path, resolve_variants=resolve_variants)
 
     def get_web_media_sync(
         self,

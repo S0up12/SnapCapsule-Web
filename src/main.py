@@ -75,7 +75,7 @@ async def _auto_import_worker(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     db = DatabaseManager(get_database_path())
     processor = MediaProcessor(cache_dir=_CACHE_DIR)
-    ingestor = IngestionService(db)
+    ingestor = IngestionService(db, processor)
     settings = SettingsManager(db)
 
     app.state.db = db

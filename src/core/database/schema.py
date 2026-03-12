@@ -322,21 +322,42 @@ class DatabaseManager:
                 (title, username),
             )
 
-    def add_message(self, username: str, msg: Message) -> int | None:
+    def add_messages_batch(
+        self,
+        username: str,
+        messages: list[Message],
+        display_name: str | None = None,
+    ) -> int:
         username = (username or "").strip()
-        if not username:
-            return None
+        if not username or not messages:
+            return 0
 
-        dedupe_key = self._message_dedupe_key(username, msg)
-        sender = (msg.sender or "").strip()
-        with self._connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO conversations (username) VALUES (?)", (username,))
+        prepared_messages: list[tuple[Message, str, str]] = []
+        senders: set[str] = set()
+        all_refs: set[str] = set()
+        for msg in messages:
+            dedupe_key = self._message_dedupe_key(username, msg)
+            sender = (msg.sender or "").strip()
+            prepared_messages.append((msg, dedupe_key, sender))
             if sender:
+                senders.add(sender)
+            all_refs.update(ref for ref in msg.media_refs if ref)
+
+        with self._connect() as conn:
+            conn.execute("BEGIN TRANSACTION")
+            conn.execute("INSERT OR IGNORE INTO conversations (username) VALUES (?)", (username,))
+            if display_name:
                 conn.execute(
-                    "INSERT OR IGNORE INTO users (username) VALUES (?)",
-                    (sender,),
+                    "UPDATE conversations SET display_name = ? WHERE username = ?",
+                    (display_name, username),
                 )
-            cursor = conn.execute(
+            if senders:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO users (username) VALUES (?)",
+                    [(sender,) for sender in sorted(senders)],
+                )
+
+            conn.executemany(
                 """
                 INSERT OR IGNORE INTO messages (
                     username,
@@ -349,43 +370,77 @@ class DatabaseManager:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    username,
-                    sender or msg.sender,
-                    msg.content,
-                    self._serialize_datetime(msg.timestamp),
-                    msg.msg_type,
-                    getattr(msg, "source", None) or "chat",
-                    dedupe_key,
-                ),
+                [
+                    (
+                        username,
+                        sender or msg.sender,
+                        msg.content,
+                        self._serialize_datetime(msg.timestamp),
+                        msg.msg_type,
+                        getattr(msg, "source", None) or "chat",
+                        dedupe_key,
+                    )
+                    for msg, dedupe_key, sender in prepared_messages
+                ],
             )
 
-            if cursor.lastrowid:
-                msg_id = int(cursor.lastrowid)
-            else:
-                row = conn.execute(
-                    "SELECT id FROM messages WHERE dedupe_key = ?",
-                    (dedupe_key,),
-                ).fetchone()
-                msg_id = int(row[0]) if row else None
+            message_ids: dict[str, int] = {}
+            dedupe_keys = [dedupe_key for _, dedupe_key, _ in prepared_messages]
+            if dedupe_keys:
+                for offset in range(0, len(dedupe_keys), 500):
+                    chunk = dedupe_keys[offset : offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT id, dedupe_key FROM messages WHERE dedupe_key IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                    message_ids.update({row[1]: int(row[0]) for row in rows})
 
-            if msg_id and msg.media_refs:
-                refs = list(dict.fromkeys(ref for ref in msg.media_refs if ref))
-                if refs:
-                    placeholders = ",".join("?" for _ in refs)
+            asset_map: dict[str, str] = {}
+            refs = sorted(all_refs)
+            if refs:
+                for offset in range(0, len(refs), 500):
+                    chunk = refs[offset : offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
                     rows = conn.execute(
                         f"SELECT asset_id, file_path FROM assets WHERE file_path IN ({placeholders})",
-                        refs,
+                        chunk,
                     ).fetchall()
-                    asset_map = {row[1]: row[0] for row in rows}
-                    pairs = [(msg_id, asset_map[ref]) for ref in refs if ref in asset_map]
-                    if pairs:
-                        conn.executemany(
-                            "INSERT OR IGNORE INTO message_media (message_id, asset_id) VALUES (?, ?)",
-                            pairs,
-                        )
+                    asset_map.update({row[1]: row[0] for row in rows})
 
-            return msg_id
+            link_pairs: list[tuple[int, str]] = []
+            for msg, dedupe_key, _ in prepared_messages:
+                msg_id = message_ids.get(dedupe_key)
+                if not msg_id or not msg.media_refs:
+                    continue
+                refs = list(dict.fromkeys(ref for ref in msg.media_refs if ref))
+                link_pairs.extend(
+                    (msg_id, asset_map[ref])
+                    for ref in refs
+                    if ref in asset_map
+                )
+
+            if link_pairs:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO message_media (message_id, asset_id) VALUES (?, ?)",
+                    link_pairs,
+                )
+
+            conn.commit()
+            return len(message_ids)
+
+    def add_message(self, username: str, msg: Message) -> int | None:
+        username = (username or "").strip()
+        if not username:
+            return None
+
+        self.add_messages_batch(username, [msg])
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM messages WHERE dedupe_key = ?",
+                (self._message_dedupe_key(username, msg),),
+            ).fetchone()
+            return int(row[0]) if row else None
 
     def clear_messages(self) -> None:
         with self._connect() as conn:
@@ -418,8 +473,52 @@ class DatabaseManager:
     def get_conversations(self) -> list[dict]:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute("SELECT username, display_name FROM conversations")
+            cursor = conn.execute(
+                """
+                SELECT
+                    c.username,
+                    c.display_name,
+                    COUNT(m.id) AS message_count
+                FROM conversations c
+                LEFT JOIN messages m ON m.username = c.username
+                GROUP BY c.username, c.display_name
+                ORDER BY COALESCE(MAX(m.timestamp), '') DESC, c.username COLLATE NOCASE
+                """
+            )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_message_media_map(self, message_ids: list[int]) -> dict[int, list[dict[str, str | None]]]:
+        ids = [message_id for message_id in message_ids if message_id is not None]
+        if not ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT
+                    mm.message_id,
+                    a.file_path,
+                    a.overlay_path,
+                    a.file_type
+                FROM message_media mm
+                JOIN assets a ON a.asset_id = mm.asset_id
+                WHERE mm.message_id IN ({placeholders})
+                ORDER BY mm.message_id ASC, a.file_path ASC
+                """,
+                ids,
+            )
+
+            media_map: dict[int, list[dict[str, str | None]]] = {}
+            for message_id, file_path, overlay_path, file_type in cursor.fetchall():
+                media_map.setdefault(int(message_id), []).append(
+                    {
+                        "file_path": file_path,
+                        "overlay_path": overlay_path,
+                        "file_type": file_type,
+                    }
+                )
+            return media_map
 
     def _message_rows_to_models(self, rows: list[tuple]) -> list[Message]:
         results = []

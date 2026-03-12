@@ -83,6 +83,38 @@ function MemorySkeleton() {
   );
 }
 
+function MemoryPreviewPlaceholder({ memory }: { memory: MemoryItem }) {
+  return (
+    <div className="flex h-full items-center justify-center bg-gray-800 text-center text-slate-400 animate-pulse">
+      <div className="flex flex-col items-center gap-2 px-4">
+        <ImageIcon className="h-8 w-8" />
+        <span className="text-xs font-medium uppercase tracking-[0.18em]">
+          {isVideo(memory) ? "Video preview pending" : "Preview pending"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function MemoryThumbnail({ memory }: { memory: MemoryItem }) {
+  const previewUrl = memory.thumbnail_url || (!isVideo(memory) ? memory.media_url : null);
+  const [failed, setFailed] = useState(false);
+
+  if (!previewUrl || failed) {
+    return <MemoryPreviewPlaceholder memory={memory} />;
+  }
+
+  return (
+    <img
+      src={previewUrl}
+      alt={formatMemoryLabel(memory)}
+      loading="lazy"
+      onError={() => setFailed(true)}
+      className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+    />
+  );
+}
+
 export default function Memories() {
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [selectedMemory, setSelectedMemory] = useState<MemoryItem | null>(null);
@@ -242,18 +274,7 @@ export default function Memories() {
                   onClick={() => setSelectedMemory(memory)}
                   className="group relative aspect-[3/4] overflow-hidden rounded-[1.5rem] border border-white/10 bg-slate-900 text-left shadow-lg shadow-black/25 transition-transform duration-300 hover:-translate-y-1"
                 >
-                  {memory.thumbnail_url ? (
-                    <img
-                      src={memory.thumbnail_url}
-                      alt={formatMemoryLabel(memory)}
-                      loading="lazy"
-                      className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
-                    />
-                  ) : (
-                    <div className="flex h-full items-center justify-center bg-white/[0.04] text-slate-500">
-                      <ImageIcon className="h-8 w-8" />
-                    </div>
-                  )}
+                  <MemoryThumbnail memory={memory} />
 
                   <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between p-3">
                     <span className="rounded-full border border-white/10 bg-black/35 px-2.5 py-1 text-[11px] font-medium uppercase tracking-[0.2em] text-white/85 backdrop-blur">

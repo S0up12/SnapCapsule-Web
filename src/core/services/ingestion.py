@@ -17,8 +17,14 @@ import rarfile
 
 from core.database.schema import DatabaseManager
 from core.models import Message, MediaAsset
+from core.services.media_processor import MediaProcessor
 from core.utils.logger import get_logger
-from core.utils.media_paths import is_overlay_variant, normalize_media_stem
+from core.utils.media_paths import (
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    is_overlay_variant,
+    normalize_media_stem,
+)
 from core.utils.paths import get_app_data_dir, get_raw_media_dir
 from bs4 import BeautifulSoup
 
@@ -62,9 +68,11 @@ class IngestionService:
     )
     ARCHIVE_SUFFIXES = (".zip", ".rar", ".7z")
 
-    def __init__(self, db: DatabaseManager):
+    def __init__(self, db: DatabaseManager, processor: MediaProcessor):
         self.db = db
+        self.processor = processor
         self.chunk_size = 100
+        self.message_chunk_size = 500
         self.current_root: Optional[Path] = None
         self.media_buckets: Dict[str, List[Dict]] = {} 
         self.media_id_map: Dict[str, str] = {}
@@ -357,6 +365,36 @@ class IngestionService:
                 return source.replace(candidate)
             counter += 1
 
+    def _group_archives_by_family(self, archives: list[Path]) -> list[list[Path]]:
+        if not archives:
+            return []
+
+        known_stems = {archive_path.stem for archive_path in archives}
+        groups: list[list[Path]] = []
+        current_group: list[Path] = []
+        current_family: str | None = None
+
+        for archive_path in archives:
+            family, _ = self._archive_family_key(archive_path, known_stems)
+            if current_family != family:
+                if current_group:
+                    groups.append(current_group)
+                current_group = [archive_path]
+                current_family = family
+            else:
+                current_group.append(archive_path)
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    @staticmethod
+    def _batched(items: list[Any], size: int) -> list[list[Any]]:
+        if size <= 0:
+            return [items]
+        return [items[index : index + size] for index in range(0, len(items), size)]
+
     def process_pending_queue(
         self,
         pending_dir: Path,
@@ -394,52 +432,65 @@ class IngestionService:
         )
 
         try:
-            for index, archive_path in enumerate(archives, start=1):
-                self._raise_if_cancelled()
-                self._prepare_clean_directory(extracted_dir)
-                self._update_job_status(
-                    current_archive=archive_path.name,
-                    current_archive_index=index,
-                    current_archive_total=total_archives,
-                    current_step=f"Processing archive {index} of {total_archives}",
-                    overall_progress=(index - 1) / total_archives,
-                    download_total=0,
-                    download_completed=0,
-                    download_skipped=0,
-                    download_failed=0,
-                )
-
-                def archive_progress(progress: float, message: str) -> None:
-                    overall = ((index - 1) + progress) / total_archives
-                    step_message = f"Processing archive {index} of {total_archives}: {message}"
+            archive_groups = self._group_archives_by_family(archives)
+            flat_index = 0
+            for group in archive_groups:
+                for position, archive_path in enumerate(group, start=1):
+                    flat_index += 1
+                    self._raise_if_cancelled()
+                    self._prepare_clean_directory(extracted_dir)
                     self._update_job_status(
                         current_archive=archive_path.name,
-                        current_archive_index=index,
+                        current_archive_index=flat_index,
                         current_archive_total=total_archives,
-                        current_step=step_message,
-                        overall_progress=min(overall, 1.0),
+                        current_step=f"Processing archive {flat_index} of {total_archives}",
+                        overall_progress=(flat_index - 1) / total_archives,
+                        download_total=0,
+                        download_completed=0,
+                        download_skipped=0,
+                        download_failed=0,
                     )
-                    if progress_cb:
-                        progress_cb(min(overall, 1.0), step_message)
 
-                success = self.process_archive(archive_path, extracted_dir, archive_progress)
-                moved_to = self._move_to_bucket(
-                    archive_path,
-                    processed_dir if success else failed_dir,
-                )
-                results.append(
-                    {
-                        "archive": archive_path.name,
-                        "success": bool(success),
-                        "destination": str(moved_to),
-                    }
-                )
-                if success:
-                    processed_count += 1
-                else:
-                    failed_count += 1
-                self._prepare_clean_directory(extracted_dir)
-                if self.was_cancelled():
+                    finalize_family = position == len(group)
+
+                    def archive_progress(progress: float, message: str) -> None:
+                        overall = ((flat_index - 1) + progress) / total_archives
+                        step_message = f"Processing archive {flat_index} of {total_archives}: {message}"
+                        self._update_job_status(
+                            current_archive=archive_path.name,
+                            current_archive_index=flat_index,
+                            current_archive_total=total_archives,
+                            current_step=step_message,
+                            overall_progress=min(overall, 1.0),
+                        )
+                        if progress_cb:
+                            progress_cb(min(overall, 1.0), step_message)
+
+                    success = self.process_archive(
+                        archive_path,
+                        extracted_dir,
+                        archive_progress,
+                        finalize=finalize_family,
+                    )
+                    moved_to = self._move_to_bucket(
+                        archive_path,
+                        processed_dir if success else failed_dir,
+                    )
+                    results.append(
+                        {
+                            "archive": archive_path.name,
+                            "success": bool(success),
+                            "destination": str(moved_to),
+                        }
+                    )
+                    if success:
+                        processed_count += 1
+                    else:
+                        failed_count += 1
+                    self._prepare_clean_directory(extracted_dir)
+                    if self.was_cancelled() or not success:
+                        break
+                if self.was_cancelled() or (results and not results[-1]["success"]):
                     break
         finally:
             self._prepare_clean_directory(extracted_dir)
@@ -463,6 +514,7 @@ class IngestionService:
         archive_path: Path,
         extract_to: Path,
         progress_cb: ProgressCallback,
+        finalize: bool = True,
     ):
         archive_path = Path(archive_path)
         extract_to = Path(extract_to)
@@ -484,6 +536,20 @@ class IngestionService:
 
             progress_cb(0.32, "Staging physical media...")
             self._copy_extracted_media_to_raw(extract_to, progress_cb, start=0.32, end=0.38)
+
+            if not finalize:
+                self.current_root = self._find_snap_root(extract_to)
+                if self.contains_export_markers(self.current_root):
+                    self.db.set_config("root_path", str(self.current_root.absolute()))
+                    progress_cb(0.70, "Staging metadata...")
+                    self._create_staging_environment()
+                elif not self._has_staged_metadata():
+                    raise ValueError("No staged metadata found. Import a base archive with JSON first.")
+                else:
+                    progress_cb(0.70, "Reusing staged metadata...")
+
+                progress_cb(1.0, "Archive staged.")
+                return True
 
             return self.process_folder(
                 extract_to,
@@ -902,6 +968,8 @@ class IngestionService:
     ) -> None:
         raw_root = get_raw_media_dir()
         candidates: list[Path] = []
+        staged_files: list[Path] = []
+        copy_end = start + ((end - start) * 0.75)
         for folder_name in ("chat_media", "memories"):
             source_dir = extracted_root / folder_name
             if source_dir.exists():
@@ -927,11 +995,24 @@ class IngestionService:
                     shutil.copy2(source_file, destination)
                 except Exception as exc:
                     logger.debug(f"Failed to copy media {source_file} to {destination}: {exc}")
+                    processed += 1
+                    last_emit = self._maybe_emit_progress(
+                        progress_cb,
+                        start,
+                        copy_end,
+                        processed,
+                        total,
+                        "Staging physical media...",
+                        last_emit,
+                    )
+                    continue
+            if destination.exists():
+                staged_files.append(destination)
             processed += 1
             last_emit = self._maybe_emit_progress(
                 progress_cb,
                 start,
-                end,
+                copy_end,
                 processed,
                 total,
                 "Staging physical media...",
@@ -939,7 +1020,118 @@ class IngestionService:
             )
 
         if progress_cb:
-            progress_cb(end, "Staging physical media...")
+            progress_cb(copy_end, "Staging physical media...")
+
+        self._dispatch_media_precompute(
+            staged_files,
+            progress_cb=progress_cb,
+            start=copy_end,
+            end=end,
+        )
+
+    @staticmethod
+    def _media_variant_rank(path: Path) -> tuple[int, str]:
+        stem = path.stem.lower()
+        suffix = path.suffix.lower()
+
+        if "_media~" in stem:
+            return (0, path.name.lower())
+        if suffix in VIDEO_EXTENSIONS and stem.endswith(("_video", "-video")):
+            return (0, path.name.lower())
+        if suffix in IMAGE_EXTENSIONS and stem.endswith(("_image", "-image")):
+            return (0, path.name.lower())
+        if stem.endswith(("_main", "-main")):
+            return (1, path.name.lower())
+        if stem.endswith(("_media", "-media")):
+            return (2, path.name.lower())
+        return (3, path.name.lower())
+
+    def _dispatch_media_precompute(
+        self,
+        staged_files: list[Path],
+        progress_cb: Optional[ProgressCallback] = None,
+        start: float = 0.0,
+        end: float = 1.0,
+    ) -> None:
+        if not staged_files:
+            if progress_cb:
+                progress_cb(end, "Queueing media precompute...")
+            return
+
+        groups: dict[tuple[str, str], dict[str, list[Path] | Path | None]] = {}
+        for candidate in staged_files:
+            self._raise_if_cancelled()
+            if not candidate.exists():
+                continue
+
+            group_key = (str(candidate.parent.resolve()), normalize_media_stem(candidate.stem))
+            group = groups.setdefault(group_key, {"main": [], "overlay": None})
+            if is_overlay_variant(candidate):
+                current_overlay = group.get("overlay")
+                if current_overlay is None or candidate.name.lower() < Path(current_overlay).name.lower():
+                    group["overlay"] = candidate
+                continue
+
+            group["main"].append(candidate)
+
+        queue_targets: list[tuple[Path, Path | None]] = []
+        queued_paths: set[str] = set()
+        for group in groups.values():
+            main_files = [
+                path for path in group["main"]
+                if isinstance(path, Path) and path.exists()
+            ]
+            if not main_files:
+                continue
+
+            overlay = group["overlay"] if isinstance(group["overlay"], Path) else None
+            image_candidates = [path for path in main_files if path.suffix.lower() in IMAGE_EXTENSIONS]
+            video_candidates = [path for path in main_files if path.suffix.lower() in VIDEO_EXTENSIONS]
+
+            for candidate_set in (image_candidates, video_candidates):
+                if not candidate_set:
+                    continue
+                preferred = min(candidate_set, key=self._media_variant_rank)
+                queue_key = str(preferred.resolve())
+                if queue_key in queued_paths:
+                    continue
+                queued_paths.add(queue_key)
+                queue_targets.append((preferred, overlay))
+
+        total_targets = len(queue_targets)
+        processed_targets = 0
+        last_emit = start
+        if progress_cb:
+            progress_cb(start, "Queueing media precompute...")
+
+        for preferred, overlay in queue_targets:
+            self._raise_if_cancelled()
+            try:
+                self.processor.queue_precompute(
+                    preferred,
+                    overlay_path=overlay,
+                    resolve_variants=False,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to queue media precompute for '%s': %s",
+                    preferred,
+                    exc,
+                    exc_info=True,
+                )
+            processed_targets += 1
+            last_emit = self._maybe_emit_progress(
+                progress_cb,
+                start,
+                end,
+                processed_targets,
+                total_targets,
+                "Queueing media precompute...",
+                last_emit,
+            )
+
+        if progress_cb:
+            progress_cb(end, "Queueing media precompute...")
 
     def _has_staged_metadata(self) -> bool:
         staged_dir = self._get_staged_dir()
@@ -1231,14 +1423,15 @@ class IngestionService:
                 return 2
             return 3
 
-        total_files = 0
+        files_by_folder: dict[Path, list[Path]] = {}
         for folder in media_folders:
             if not folder.exists():
                 continue
-            total_files += sum(
-                1 for file in folder.rglob("*")
+            files_by_folder[folder] = [
+                file for file in folder.rglob("*")
                 if file.is_file() and not file.name.startswith(".")
-            )
+            ]
+        total_files = sum(len(files) for files in files_by_folder.values())
 
         processed_files = 0
         last_emit = start
@@ -1246,39 +1439,40 @@ class IngestionService:
             progress_cb(start, "Indexing Media...")
 
         for folder in media_folders:
-            if not folder.exists(): continue
+            files = files_by_folder.get(folder)
+            if not files:
+                continue
             is_chat_media = (folder.name == "chat_media")
             
             groups = {}
-            for file in folder.rglob("*"):
+            batch = []
+            for file in files:
                 self._raise_if_cancelled()
-                if file.is_file() and not file.name.startswith("."):
-                    processed_files += 1
-                    last_emit = self._maybe_emit_progress(
-                        progress_cb, start, end, processed_files, total_files, "Indexing Media...", last_emit
-                    )
-                    stem_id = get_stem_id(file)
-                    if stem_id not in groups:
-                        groups[stem_id] = {"main": None, "overlay": None, "ts": None}
-                    
-                    is_overlay_file = is_overlay_variant(file)
-                    
-                    if is_overlay_file:
-                        groups[stem_id]["overlay"] = file
+                processed_files += 1
+                last_emit = self._maybe_emit_progress(
+                    progress_cb, start, end, processed_files, total_files, "Indexing Media...", last_emit
+                )
+                stem_id = get_stem_id(file)
+                if stem_id not in groups:
+                    groups[stem_id] = {"main": None, "overlay": None, "ts": None}
+                
+                is_overlay_file = is_overlay_variant(file)
+                
+                if is_overlay_file:
+                    groups[stem_id]["overlay"] = file
+                else:
+                    main = groups[stem_id]["main"]
+                    if not main:
+                        groups[stem_id]["main"] = file
+                        groups[stem_id]["ts"] = self._get_best_timestamp(file, date_pattern)
                     else:
-                        main = groups[stem_id]["main"]
-                        if not main:
+                        if is_video(file) and not is_video(main):
                             groups[stem_id]["main"] = file
                             groups[stem_id]["ts"] = self._get_best_timestamp(file, date_pattern)
-                        else:
-                            if is_video(file) and not is_video(main):
-                                groups[stem_id]["main"] = file
-                                groups[stem_id]["ts"] = self._get_best_timestamp(file, date_pattern)
-                            elif is_video(file) == is_video(main) and main_rank(file) < main_rank(main):
-                                groups[stem_id]["main"] = file
-                                groups[stem_id]["ts"] = self._get_best_timestamp(file, date_pattern)
+                        elif is_video(file) == is_video(main) and main_rank(file) < main_rank(main):
+                            groups[stem_id]["main"] = file
+                            groups[stem_id]["ts"] = self._get_best_timestamp(file, date_pattern)
 
-            batch = []
             for stem_id, data in groups.items():
                 self._raise_if_cancelled()
                 main_file = data.get("main")
@@ -1500,31 +1694,39 @@ class IngestionService:
                 entry["media"] = media["path"]
                 media["claimed"] = True
 
+        messages_by_conversation: dict[str, list[Message]] = {}
+        for entry in snap_entries:
+            media_path = entry.get("media")
+            if not media_path:
+                continue
+            messages_by_conversation.setdefault(entry["conversation_id"], []).append(
+                Message(
+                    sender=entry["sender"],
+                    content="",
+                    timestamp=entry["ts"],
+                    msg_type=entry["type"],
+                    media_refs=[media_path],
+                    source="snap",
+                )
+            )
+
         processed = 0
         last_emit = start
         if progress_cb:
             progress_cb(start, "Parsing Snap History...")
 
-        for entry in snap_entries:
-            self._raise_if_cancelled()
-            processed += 1
-            media_path = entry.get("media")
-            if not media_path:
+        for conversation_id, conversation_messages in messages_by_conversation.items():
+            for chunk in self._batched(conversation_messages, self.message_chunk_size):
+                self._raise_if_cancelled()
+                self.db.add_messages_batch(conversation_id, chunk)
+                processed += len(chunk)
                 last_emit = self._maybe_emit_progress(
                     progress_cb, start, end, processed, total, "Parsing Snap History...", last_emit
                 )
-                continue
-            msg = Message(
-                sender=entry["sender"],
-                content="",
-                timestamp=entry["ts"],
-                msg_type=entry["type"],
-                media_refs=[media_path],
-                source="snap"
-            )
-            self.db.add_message(entry["conversation_id"], msg)
+
+        if processed < total:
             last_emit = self._maybe_emit_progress(
-                progress_cb, start, end, processed, total, "Parsing Snap History...", last_emit
+                progress_cb, start, end, total, total, "Parsing Snap History...", last_emit
             )
 
     def _count_messages(self, data: Any) -> int:
@@ -1596,7 +1798,7 @@ class IngestionService:
         if found_title:
             self.db.update_conversation_title(conversation_id, found_title)
 
-        sorted_messages = []
+        message_models: list[Message] = []
         for entry in messages:
             self._raise_if_cancelled()
             try:
@@ -1608,31 +1810,33 @@ class IngestionService:
                 clean_ts = ts_raw.replace(" UTC", "")
                 ts = datetime.fromisoformat(clean_ts)
                 
-                sorted_messages.append({
-                    "data": entry,
-                    "ts": ts,
-                    "sender": sender,
-                    "content": content,
-                    "type": media_type,
-                    "media_ids": self._parse_media_ids(entry.get("Media IDs", ""))
-                })
+                linked_media = self._find_media_for_message(
+                    ts,
+                    self._parse_media_ids(entry.get("Media IDs", "")),
+                    media_type,
+                )
+                message_models.append(
+                    Message(
+                        sender=sender,
+                        content=content if content else "",
+                        timestamp=ts,
+                        msg_type=media_type,
+                        media_refs=linked_media,
+                    )
+                )
             except: continue
-            
-        sorted_messages.sort(key=lambda x: x["ts"])
 
-        for item in sorted_messages:
+        message_models.sort(key=lambda item: item.timestamp)
+
+        for chunk in self._batched(message_models, self.message_chunk_size):
             self._raise_if_cancelled()
-            linked_media = self._find_media_for_message(item["ts"], item["media_ids"], item["type"])
-            msg = Message(
-                sender=item["sender"],
-                content=item["content"] if item["content"] else "",
-                timestamp=item["ts"],
-                msg_type=item["type"],
-                media_refs=linked_media
+            self.db.add_messages_batch(
+                conversation_id,
+                chunk,
+                display_name=found_title,
             )
-            self.db.add_message(conversation_id, msg)
             if progress_state is not None:
-                progress_state["processed"] += 1
+                progress_state["processed"] += len(chunk)
                 progress_state["last"] = self._maybe_emit_progress(
                     progress_cb,
                     start,

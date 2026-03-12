@@ -12,6 +12,7 @@ import Lightbox from "../components/Lightbox";
 type ConversationApiItem = {
   username: string;
   display_name: string | null;
+  message_count: number | null;
 };
 
 type ConversationsResponse = {
@@ -19,9 +20,7 @@ type ConversationsResponse = {
   total: number;
 };
 
-type Conversation = ConversationApiItem & {
-  message_count: number | null;
-};
+type Conversation = ConversationApiItem;
 
 type ChatMedia = {
   media_url: string | null;
@@ -106,6 +105,85 @@ function conversationLabel(conversation: Conversation | null) {
   return conversation.display_name || conversation.username;
 }
 
+function ChatMediaPlaceholder({ video }: { video: boolean }) {
+  return (
+    <div className="flex min-h-[180px] items-center justify-center bg-gray-800 px-4 text-center text-slate-400 animate-pulse">
+      <div className="flex flex-col items-center gap-2">
+        {video ? <Video className="h-8 w-8" /> : <ImageIcon className="h-8 w-8" />}
+        <span className="text-xs font-medium uppercase tracking-[0.18em]">
+          {video ? "Video unavailable" : "Preview unavailable"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+type ChatMediaPreviewProps = {
+  media: ChatMedia;
+  messageTitle: string;
+  onOpen: (selection: SelectedMedia) => void;
+};
+
+function ChatMediaPreview({ media, messageTitle, onOpen }: ChatMediaPreviewProps) {
+  const video = isVideoMedia(media.media_url);
+  const previewUrl = media.thumbnail_url || (!video ? media.media_url : null);
+  const mediaUrl = media.media_url;
+  const [failed, setFailed] = useState(false);
+
+  if (!previewUrl || failed) {
+    return <ChatMediaPlaceholder video={video} />;
+  }
+
+  if (video) {
+    return (
+      <button
+        type="button"
+        onClick={(event) => {
+          event.preventDefault();
+          onOpen({
+            mediaUrl,
+            overlayUrl: media.overlay_url,
+            isVideo: true,
+            title: messageTitle,
+          });
+        }}
+        className="relative block w-full"
+      >
+        <img
+          src={previewUrl}
+          alt={messageTitle}
+          loading="lazy"
+          onError={() => setFailed(true)}
+          className="max-h-[360px] w-full cursor-pointer bg-black object-cover transition-opacity hover:opacity-90"
+        />
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/20">
+          <div className="rounded-full border border-white/15 bg-black/45 p-3 text-white shadow-lg shadow-black/40">
+            <Video className="h-5 w-5" />
+          </div>
+        </div>
+      </button>
+    );
+  }
+
+  return (
+    <img
+      src={previewUrl}
+      alt={messageTitle}
+      loading="lazy"
+      onError={() => setFailed(true)}
+      onClick={() =>
+        onOpen({
+          mediaUrl: mediaUrl || previewUrl,
+          overlayUrl: media.overlay_url,
+          isVideo: false,
+          title: messageTitle,
+        })
+      }
+      className="max-h-[420px] w-full cursor-pointer object-cover transition-opacity hover:opacity-90"
+    />
+  );
+}
+
 export default function Chats() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
@@ -166,39 +244,8 @@ export default function Chats() {
       }
 
       const payload = (await response.json()) as ConversationsResponse;
-      const baseItems = payload.items.map((item) => ({
-        ...item,
-        message_count: null,
-      }));
-
-      setConversations(baseItems);
+      setConversations(payload.items);
       setSidebarError(null);
-
-      const counts = await Promise.all(
-        payload.items.map(async (item) => {
-          try {
-            const countResponse = await fetch(
-              `/api/chats/${encodeURIComponent(item.username)}/messages?skip=0&limit=1`,
-            );
-            if (!countResponse.ok) {
-              throw new Error("count");
-            }
-
-            const countPayload = (await countResponse.json()) as MessagesResponse;
-            return [item.username, countPayload.total] as const;
-          } catch {
-            return [item.username, null] as const;
-          }
-        }),
-      );
-
-      const countMap = new Map(counts);
-      setConversations(
-        payload.items.map((item) => ({
-          ...item,
-          message_count: countMap.get(item.username) ?? null,
-        })),
-      );
     } catch (requestError) {
       setSidebarError(
         requestError instanceof Error
@@ -517,52 +564,16 @@ export default function Chats() {
                             {message.media.length > 0 ? (
                               <div className="mt-3 grid gap-3">
                                 {message.media.map((media, mediaIndex) => {
-                                  const previewUrl = media.thumbnail_url || media.media_url;
-                                  const mediaUrl = media.media_url;
-                                  const video = isVideoMedia(mediaUrl || previewUrl);
-
-                                  if (!previewUrl) {
-                                    return null;
-                                  }
-
                                   return (
                                     <div
                                       key={`${message.id}-${mediaIndex}`}
                                       className="overflow-hidden rounded-[1.2rem] border border-white/10 bg-black/20"
                                     >
-                                      {video ? (
-                                        <video
-                                          src={mediaUrl || previewUrl}
-                                          controls
-                                          preload="metadata"
-                                          onClick={(event) => {
-                                            event.preventDefault();
-                                            event.currentTarget.pause();
-                                            setSelectedMedia({
-                                              mediaUrl: mediaUrl || previewUrl,
-                                              overlayUrl: media.overlay_url,
-                                              isVideo: true,
-                                              title: message.content || "Chat media",
-                                            });
-                                          }}
-                                          className="max-h-[360px] w-full cursor-pointer bg-black object-cover transition-opacity hover:opacity-90"
-                                        />
-                                      ) : (
-                                        <img
-                                          src={previewUrl}
-                                          alt={message.content || "Chat media"}
-                                          loading="lazy"
-                                          onClick={() =>
-                                            setSelectedMedia({
-                                              mediaUrl: mediaUrl || previewUrl,
-                                              overlayUrl: media.overlay_url,
-                                              isVideo: false,
-                                              title: message.content || "Chat media",
-                                            })
-                                          }
-                                          className="max-h-[420px] w-full cursor-pointer object-cover transition-opacity hover:opacity-90"
-                                        />
-                                      )}
+                                      <ChatMediaPreview
+                                        media={media}
+                                        messageTitle={message.content || "Chat media"}
+                                        onOpen={setSelectedMedia}
+                                      />
                                     </div>
                                   );
                                 })}

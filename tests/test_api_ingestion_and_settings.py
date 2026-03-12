@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from core.database.schema import DatabaseManager
 from core.services.ingestion import IngestionService
+from core.services.media_processor import MediaProcessor
 from core.services.settings import SettingsManager
 from routers.ingestion import router as ingestion_router
 from routers.settings import router as settings_router
@@ -26,6 +27,7 @@ def _build_test_client(tmp_path: Path, monkeypatch) -> TestClient:
     database_dir = data_root / "database"
     imports_dir = data_root / "imports"
     raw_media_dir = data_root / "raw_media"
+    cache_dir = data_root / "cache"
 
     monkeypatch.setenv("SNAPCAPSULE_DATA_DIR", str(data_root))
     monkeypatch.setenv("SNAPCAPSULE_DATABASE_DIR", str(database_dir))
@@ -36,11 +38,14 @@ def _build_test_client(tmp_path: Path, monkeypatch) -> TestClient:
     database_dir.mkdir(parents=True, exist_ok=True)
     imports_dir.mkdir(parents=True, exist_ok=True)
     raw_media_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     db = DatabaseManager(database_dir / "app_state.db")
-    ingestor = IngestionService(db)
+    processor = MediaProcessor(cache_dir=cache_dir)
+    ingestor = IngestionService(db, processor)
     settings = SettingsManager(db)
 
     app.state.db = db
+    app.state.processor = processor
     app.state.ingestor = ingestor
     app.state.settings = settings
     app.state.ingestion_lock = threading.Lock()
