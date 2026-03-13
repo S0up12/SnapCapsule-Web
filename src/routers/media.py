@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Request
+from fastapi import BackgroundTasks, Request
 
 from core.services.media_processor import (
+    MediaProcessor,
     VIDEO_EXTENSIONS,
     build_thumbnail_cache_path,
     build_web_video_cache_path,
 )
+from core.utils.media_paths import resolve_existing_media_path
 from core.utils.paths import get_cache_dir, get_raw_media_dir
 
 
@@ -61,19 +62,8 @@ def _is_video_target(file_path: str | Path | None, file_type: str | None = None)
     return Path(str(file_path)).suffix.lower() in VIDEO_EXTENSIONS
 
 
-def _video_placeholder_data_url() -> str:
-    svg = (
-        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 400'>"
-        "<rect width='400' height='400' fill='#111827'/>"
-        "<circle cx='200' cy='200' r='64' fill='#1f2937' stroke='#334155' stroke-width='8'/>"
-        "<path d='M182 160 L248 200 L182 240 Z' fill='#cbd5e1'/>"
-        "<text x='200' y='306' text-anchor='middle' fill='#94a3b8' "
-        "font-family='Arial, sans-serif' font-size='24' letter-spacing='2'>"
-        "VIDEO"
-        "</text>"
-        "</svg>"
-    )
-    return f"data:image/svg+xml;utf8,{svg}"
+def resolve_media_path(file_path: str | Path | None) -> Path | None:
+    return resolve_existing_media_path(file_path)
 
 
 def build_media_url(request: Request, file_path: str | Path | None) -> str | None:
@@ -99,13 +89,13 @@ def resolve_media_url(request: Request, file_path: str | Path | None) -> str | N
     if isinstance(file_path, str) and not file_path.strip():
         return None
 
-    target = Path(str(file_path))
-    if not os.path.exists(target):
+    target = resolve_media_path(file_path)
+    if target is None:
         return None
 
     if target.suffix.lower() in VIDEO_EXTENSIONS:
         web_path = build_web_video_cache_path(get_cache_dir(), target)
-        if os.path.exists(web_path):
+        if web_path.exists():
             return build_media_url(request, web_path)
 
     return build_media_url(request, target)
@@ -119,11 +109,10 @@ def predict_thumbnail_url(
 ) -> str | None:
     if not file_path:
         return None
-    target = Path(str(file_path))
-    if not os.path.exists(target):
+    target = resolve_media_path(file_path)
+    if target is None:
         return None
-    overlay = Path(str(overlay_path)) if overlay_path else None
-    overlay_for_hash = overlay if overlay and os.path.exists(overlay) else None
+    overlay_for_hash = resolve_existing_media_path(overlay_path, prefer_overlay=True)
     thumbnail_path = build_thumbnail_cache_path(
         get_cache_dir(),
         target,
@@ -131,7 +120,7 @@ def predict_thumbnail_url(
         crop=False,
         overlay_path=overlay_for_hash,
     )
-    if not os.path.exists(thumbnail_path):
+    if not thumbnail_path.exists():
         return None
     return build_media_url(request, thumbnail_path)
 
@@ -157,12 +146,54 @@ def resolve_preview_url(
     if not _is_video_target(file_path, file_type=file_type):
         return media_url
 
-    return _video_placeholder_data_url()
+    return None
 
 
 def resolve_overlay_path(file_path: str | Path | None, overlay_path: str | Path | None) -> str | None:
-    if overlay_path:
-        overlay_candidate = Path(str(overlay_path))
-        if os.path.exists(overlay_candidate):
-            return _normalize_path_value(overlay_candidate)
+    del file_path
+    overlay_candidate = resolve_existing_media_path(overlay_path, prefer_overlay=True)
+    if overlay_candidate is not None:
+        return _normalize_path_value(overlay_candidate)
     return None
+
+
+def queue_missing_video_derivatives(
+    background_tasks: BackgroundTasks,
+    processor: MediaProcessor,
+    file_path: str | Path | None,
+    *,
+    file_type: str | None = None,
+    overlay_path: str | Path | None = None,
+    size: tuple[int, int] = (400, 400),
+) -> None:
+    source_path = resolve_media_path(file_path)
+    if source_path is None or not _is_video_target(source_path, file_type=file_type):
+        return
+    if processor.is_quarantined(source_path):
+        return
+
+    overlay = resolve_existing_media_path(overlay_path, prefer_overlay=True)
+    thumbnail_path = build_thumbnail_cache_path(
+        get_cache_dir(),
+        source_path,
+        size=size,
+        crop=False,
+        overlay_path=overlay,
+    )
+    if not thumbnail_path.exists():
+        background_tasks.add_task(
+            processor.queue_thumbnail,
+            source_path,
+            size,
+            False,
+            overlay,
+            False,
+        )
+
+    web_path = build_web_video_cache_path(get_cache_dir(), source_path)
+    if not web_path.exists():
+        background_tasks.add_task(
+            processor.queue_web_media,
+            source_path,
+            False,
+        )

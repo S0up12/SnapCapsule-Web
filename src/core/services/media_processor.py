@@ -5,16 +5,23 @@ import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Tuple
-from PIL import Image, ImageOps
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+
+try:
+    import pyvips
+except ImportError:  # pragma: no cover - runtime dependency in container
+    pyvips = None
+
 from core.utils.logger import get_logger
 from core.utils.media_paths import resolve_preferred_media_path
 
 logger = get_logger("MediaProcessor")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
+FFMPEG_THUMBNAIL_TIMEOUT_SECONDS = 5
+FFMPEG_WEB_TRANSCODE_TIMEOUT_SECONDS = 30
 
 
 def _normalize_overlay_path(overlay_path: Optional[str | Path]) -> Optional[str]:
@@ -42,7 +49,7 @@ def build_thumbnail_cache_path(
     )
     unique_str = f"{file_path.absolute()}_{size[0]}x{size[1]}_{mode}{overlay_sig}"
     hash_name = hashlib.md5(unique_str.encode()).hexdigest()
-    return cache_dir / f"{hash_name}.jpg"
+    return cache_dir / f"{hash_name}.webp"
 
 
 def build_web_video_cache_path(cache_dir: Path, file_path: Path) -> Path:
@@ -91,8 +98,7 @@ class MediaProcessor:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         if max_workers is None:
-            cpu_count = os.cpu_count() or 1
-            max_workers = max(1, min(2, cpu_count // 2 or 1))
+            max_workers = os.cpu_count() or 4
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
         # Cache for failed files to prevent CPU loops
@@ -101,6 +107,35 @@ class MediaProcessor:
         self._failed_lock = threading.Lock()
         self._thumbnail_futures: dict[str, Future[bool]] = {}
         self._transcode_futures: dict[str, Future[bool]] = {}
+
+    @staticmethod
+    def _absolute_path_key(file_path: str | Path | None) -> str | None:
+        if not file_path:
+            return None
+        try:
+            return str(Path(file_path).absolute())
+        except Exception:
+            return str(file_path)
+
+    def is_quarantined(self, file_path: str | Path | None) -> bool:
+        path_key = self._absolute_path_key(file_path)
+        if not path_key:
+            return False
+        with self._failed_lock:
+            return path_key in self.failed_cache
+
+    def quarantine_path(self, file_path: str | Path | None) -> None:
+        path_key = self._absolute_path_key(file_path)
+        if not path_key:
+            return
+
+        with self._failed_lock:
+            already_quarantined = path_key in self.failed_cache
+            self.failed_cache.add(path_key)
+            self.transcode_failed_cache.add(path_key)
+
+        if not already_quarantined:
+            logger.warning("Quarantined corrupt media file: %s", path_key)
 
     def clear_cache(self):
         """Safely clears the thumbnail cache."""
@@ -138,6 +173,25 @@ class MediaProcessor:
 
         return candidate
 
+    def _ensure_processable_source(self, file_path: str | Path | None) -> Path | None:
+        path_key = self._absolute_path_key(file_path)
+        if not path_key or self.is_quarantined(path_key):
+            return None
+
+        source = Path(path_key)
+        if not source.exists():
+            return None
+
+        try:
+            if os.path.getsize(source) == 0:
+                self.quarantine_path(source)
+                return None
+        except Exception:
+            self.quarantine_path(source)
+            return None
+
+        return source
+
     def get_cache_path(self, file_path: Path, size: Tuple[int, int], crop: bool, overlay_path: Optional[str] = None) -> Path:
         return build_thumbnail_cache_path(self.cache_dir, file_path, size, crop, overlay_path)
 
@@ -145,19 +199,98 @@ class MediaProcessor:
         return build_web_video_cache_path(self.cache_dir, file_path)
 
     @staticmethod
-    def _transcode_video_for_web(input_path: str, output_path: str) -> bool:
-        try:
-            source = Path(input_path)
-            target = Path(output_path)
-            if not source.exists():
-                return False
+    def _require_pyvips():
+        if pyvips is None:
+            raise RuntimeError("pyvips is required for thumbnail generation.")
+        return pyvips
 
+    def _load_vips_image(self, file_path: str | Path) -> "pyvips.Image":
+        vips = self._require_pyvips()
+        image = vips.Image.new_from_file(str(file_path), access="sequential")
+        try:
+            return image.autorot()
+        except Exception:
+            return image
+
+    @staticmethod
+    def _normalize_vips_bands(image: "pyvips.Image") -> "pyvips.Image":
+        if image.bands == 2:
+            image = image[:1].bandjoin(image[1])
+        elif image.bands > 4:
+            image = image[:4]
+        return image
+
+    def _resize_vips_image(
+        self,
+        image: "pyvips.Image",
+        size: Tuple[int, int],
+        crop: bool,
+    ) -> "pyvips.Image":
+        image = self._normalize_vips_bands(image)
+        width, height = size
+
+        if crop:
+            return image.thumbnail_image(width, height=height, crop="centre")
+
+        image = image.thumbnail_image(width)
+        if image.height > height:
+            image = image.resize(height / image.height)
+        return image
+
+    def _composite_overlay(
+        self,
+        base_image: "pyvips.Image",
+        overlay_path: str | None,
+    ) -> "pyvips.Image":
+        if not overlay_path or not os.path.exists(overlay_path):
+            return base_image
+
+        overlay = self._load_vips_image(overlay_path)
+        overlay = self._normalize_vips_bands(overlay)
+        if overlay.width != base_image.width or overlay.height != base_image.height:
+            overlay = overlay.resize(
+                base_image.width / overlay.width,
+                vscale=base_image.height / overlay.height,
+            )
+
+        if not base_image.hasalpha():
+            base_image = base_image.bandjoin(255)
+        if not overlay.hasalpha():
+            overlay = overlay.bandjoin(255)
+
+        return base_image.composite2(overlay, "over")
+
+    def _write_vips_image(self, image: "pyvips.Image", cache_path: str) -> bool:
+        image = self._normalize_vips_bands(image)
+        image.write_to_file(cache_path, Q=80)
+        target = Path(cache_path)
+        return target.exists() and target.stat().st_size > 0
+
+    def _vips_image_from_video_frame(self, frame) -> "pyvips.Image":
+        vips = self._require_pyvips()
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, bands = frame_rgb.shape
+        return vips.Image.new_from_memory(
+            frame_rgb.tobytes(),
+            width,
+            height,
+            bands,
+            "uchar",
+        )
+
+    def _transcode_video_for_web(self, input_path: str, output_path: str) -> bool:
+        source = self._ensure_processable_source(input_path)
+        if source is None:
+            return False
+
+        try:
+            target = Path(output_path)
             target.parent.mkdir(parents=True, exist_ok=True)
             command = [
                 "ffmpeg",
                 "-y",
                 "-i",
-                input_path,
+                str(source),
                 "-threads",
                 "1",
                 "-c:v",
@@ -175,34 +308,29 @@ class MediaProcessor:
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=180,
+                timeout=FFMPEG_WEB_TRANSCODE_TIMEOUT_SECONDS,
             )
             return target.exists() and target.stat().st_size > 0
-        except Exception:
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Exception):
+            self.quarantine_path(source)
             return False
 
-    @staticmethod
-    def _generate_thumbnail(file_path: str, cache_path: str, size: Tuple[int, int], crop: bool, overlay_path: Optional[str] = None) -> bool:
+    def _generate_thumbnail(self, file_path: str, cache_path: str, size: Tuple[int, int], crop: bool, overlay_path: Optional[str] = None) -> bool:
+        path = self._ensure_processable_source(file_path)
+        if path is None:
+            return False
+
         try:
-            path = Path(file_path)
-            if not path.exists():
-                return False
-            try:
-                if path.stat().st_size == 0:
-                    return False
-            except Exception:
-                return False
             Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
 
-            img = None
+            image = None
             
             # --- 1. IMAGE ---
             if path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.heic']:
                 try:
-                    with Image.open(file_path) as src:
-                        src.load()
-                        img = ImageOps.exif_transpose(src).copy()
+                    image = self._load_vips_image(path)
                 except Exception:
+                    self.quarantine_path(path)
                     return False
 
             # --- 2. VIDEO ---
@@ -212,7 +340,7 @@ class MediaProcessor:
                 try:
                     # Suppress the "moov atom not found" C-level errors
                     with suppress_c_stderr():
-                        cap = cv2.VideoCapture(file_path)
+                        cap = cv2.VideoCapture(str(path))
 
                     if cap is not None and cap.isOpened():
                         w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -221,8 +349,7 @@ class MediaProcessor:
                         if w > 0 and h > 0:
                             ret, frame = cap.read()
                             if ret:
-                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                img = Image.fromarray(frame_rgb)
+                                image = self._vips_image_from_video_frame(frame)
                 except Exception:
                     pass
                 finally:
@@ -233,63 +360,64 @@ class MediaProcessor:
                         pass
 
                 # Strategy B: FFmpeg
-                if img is None:
+                if image is None:
                     try:
                         # Suppress FFmpeg command line output
                         cmd = [
-                            "ffmpeg", "-y", "-i", file_path, 
-                            "-ss", "00:00:00", "-vframes", "1", 
-                            "-q:v", "2", cache_path
+                            "ffmpeg",
+                            "-y",
+                            "-ss",
+                            "00:00:00",
+                            "-i",
+                            str(path),
+                            "-frames:v",
+                            "1",
+                            "-c:v",
+                            "libwebp",
+                            "-update",
+                            "1",
+                            cache_path,
                         ]
-                        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                        subprocess.run(
+                            cmd,
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=FFMPEG_THUMBNAIL_TIMEOUT_SECONDS,
+                        )
                         
                         if os.path.exists(cache_path):
-                            with Image.open(cache_path) as src:
-                                src.load()
-                                img = src.copy()
+                            image = self._load_vips_image(cache_path)
                     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Exception):
-                        pass
+                        self.quarantine_path(path)
+                        return False
 
-            if not img:
+            if image is None:
+                self.quarantine_path(path)
                 return False
 
             # --- 3. APPLY OVERLAY ---
             if overlay_path:
                 try:
-                    if os.path.exists(overlay_path):
-                        with Image.open(overlay_path) as overlay_img:
-                            overlay_img.load()
-                            overlay = overlay_img.convert("RGBA")
-                        img = img.convert("RGBA")
-                        if overlay.size != img.size:
-                            overlay = overlay.resize(img.size, Image.Resampling.LANCZOS)
-                        img = Image.alpha_composite(img, overlay)
-                        img = img.convert("RGB")
+                    image = self._composite_overlay(image, overlay_path)
                 except Exception:
                     pass 
 
             # --- 4. RESIZE & SAVE ---
-            if img.mode in ("RGBA", "P"): 
-                img = img.convert("RGB")
-            
-            if crop:
-                img = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS)
-            else:
-                img.thumbnail(size, Image.Resampling.LANCZOS)
-            
-            img.save(cache_path, "JPEG", quality=85)
-            return True
+            image = self._resize_vips_image(image, size, crop)
+            return self._write_vips_image(image, cache_path)
 
         except Exception:
+            self.quarantine_path(path)
             return False
 
     async def get_thumbnail(self, file_path: Path, size: Tuple[int, int] = (200, 200), crop: bool = False, overlay_path: Optional[Path] = None) -> Optional[Path]:
         resolved_path = Path(resolve_preferred_media_path(str(file_path)))
-        path_str = str(resolved_path.absolute())
-
-        with self._failed_lock:
-            if path_str in self.failed_cache:
-                return None
+        path_str = self._absolute_path_key(resolved_path)
+        if path_str is None or self.is_quarantined(path_str):
+            return None
+        if self._ensure_processable_source(resolved_path) is None:
+            return None
 
         o_path_str = str(overlay_path.absolute()) if overlay_path else None
         cache_path = self.get_cache_path(resolved_path, size, crop, o_path_str)
@@ -320,8 +448,7 @@ class MediaProcessor:
         if success:
             logger.info(f"Thumbnail saved to cache: {cache_path}")
             return cache_path
-        with self._failed_lock:
-            self.failed_cache.add(path_str)
+        self.quarantine_path(path_str)
         return None
 
     def _finalize_thumbnail_future(
@@ -339,10 +466,8 @@ class MediaProcessor:
             current_future = self._thumbnail_futures.get(cache_key)
             if current_future is future and future.done():
                 self._thumbnail_futures.pop(cache_key, None)
-            if success:
-                self.failed_cache.discard(source_key)
-            else:
-                self.failed_cache.add(source_key)
+        if not success:
+            self.quarantine_path(source_key)
 
     def _finalize_transcode_future(
         self,
@@ -358,10 +483,8 @@ class MediaProcessor:
             current_future = self._transcode_futures.get(source_key)
             if current_future is future and future.done():
                 self._transcode_futures.pop(source_key, None)
-            if success:
-                self.transcode_failed_cache.discard(source_key)
-            else:
-                self.transcode_failed_cache.add(source_key)
+        if not success:
+            self.quarantine_path(source_key)
 
     def queue_thumbnail(
         self,
@@ -374,13 +497,12 @@ class MediaProcessor:
         resolved_path = self._prepare_media_path(file_path, resolve_variants=resolve_variants)
         if resolved_path is None:
             return
-        if not resolved_path.exists():
+        if not resolved_path.exists() or self._ensure_processable_source(resolved_path) is None:
             return
 
-        source_key = str(resolved_path.absolute())
-        with self._failed_lock:
-            if source_key in self.failed_cache:
-                return
+        source_key = self._absolute_path_key(resolved_path)
+        if source_key is None or self.is_quarantined(source_key):
+            return
 
         overlay_str = None
         if overlay_path and overlay_path.exists():
@@ -422,13 +544,16 @@ class MediaProcessor:
         resolved_path = self._prepare_media_path(file_path, resolve_variants=resolve_variants)
         if resolved_path is None:
             return
-        if resolved_path.suffix.lower() not in VIDEO_EXTENSIONS or not resolved_path.exists():
+        if (
+            resolved_path.suffix.lower() not in VIDEO_EXTENSIONS
+            or not resolved_path.exists()
+            or self._ensure_processable_source(resolved_path) is None
+        ):
             return
 
-        source_key = str(resolved_path.absolute())
-        with self._failed_lock:
-            if source_key in self.transcode_failed_cache:
-                return
+        source_key = self._absolute_path_key(resolved_path)
+        if source_key is None or self.is_quarantined(source_key):
+            return
 
         web_path = self.get_web_video_path(resolved_path)
         try:
@@ -485,10 +610,11 @@ class MediaProcessor:
         if resolved_path.suffix.lower() not in VIDEO_EXTENSIONS:
             return resolved_path if resolved_path.exists() else None
 
-        path_str = str(resolved_path.absolute())
-        with self._failed_lock:
-            if path_str in self.transcode_failed_cache:
-                return resolved_path if resolved_path.exists() else None
+        path_str = self._absolute_path_key(resolved_path)
+        if path_str is None or self.is_quarantined(path_str):
+            return resolved_path if resolved_path.exists() else None
+        if self._ensure_processable_source(resolved_path) is None:
+            return resolved_path if resolved_path.exists() else None
 
         web_path = self.get_web_video_path(resolved_path)
         try:
@@ -525,8 +651,7 @@ class MediaProcessor:
             logger.info(f"Web-safe video saved to cache: {web_path}")
             return web_path
 
-        with self._failed_lock:
-            self.transcode_failed_cache.add(path_str)
+        self.quarantine_path(path_str)
         return resolved_path if resolved_path.exists() else None
 
     def get_thumbnail_sync(
@@ -538,11 +663,11 @@ class MediaProcessor:
         timeout: float | None = None,
     ) -> Optional[Path]:
         resolved_path = Path(resolve_preferred_media_path(str(file_path)))
-        path_str = str(resolved_path.absolute())
-
-        with self._failed_lock:
-            if path_str in self.failed_cache:
-                return None
+        path_str = self._absolute_path_key(resolved_path)
+        if path_str is None or self.is_quarantined(path_str):
+            return None
+        if self._ensure_processable_source(resolved_path) is None:
+            return None
 
         o_path_str = str(overlay_path.absolute()) if overlay_path else None
         cache_path = self.get_cache_path(resolved_path, size, crop, o_path_str)
@@ -570,6 +695,5 @@ class MediaProcessor:
         if success:
             logger.info(f"Thumbnail saved to cache: {cache_path}")
             return cache_path
-        with self._failed_lock:
-            self.failed_cache.add(path_str)
+        self.quarantine_path(path_str)
         return None

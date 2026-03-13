@@ -97,8 +97,24 @@ function MemoryPreviewPlaceholder({ memory }: { memory: MemoryItem }) {
 }
 
 function MemoryThumbnail({ memory }: { memory: MemoryItem }) {
-  const previewUrl = memory.thumbnail_url || (!isVideo(memory) ? memory.media_url : null);
+  const video = isVideo(memory);
+  const previewSources = video
+    ? memory.thumbnail_url
+      ? [memory.thumbnail_url]
+      : []
+    : [memory.thumbnail_url, memory.media_url].filter(
+        (value, index, items): value is string =>
+          Boolean(value) && items.indexOf(value) === index,
+      );
+  const [sourceIndex, setSourceIndex] = useState(0);
   const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setSourceIndex(0);
+    setFailed(false);
+  }, [memory.asset_id, memory.media_url, memory.thumbnail_url, video]);
+
+  const previewUrl = previewSources[sourceIndex] ?? null;
 
   if (!previewUrl || failed) {
     return <MemoryPreviewPlaceholder memory={memory} />;
@@ -109,7 +125,14 @@ function MemoryThumbnail({ memory }: { memory: MemoryItem }) {
       src={previewUrl}
       alt={formatMemoryLabel(memory)}
       loading="lazy"
-      onError={() => setFailed(true)}
+      decoding="async"
+      onError={() => {
+        if (!video && sourceIndex < previewSources.length - 1) {
+          setSourceIndex((current) => current + 1);
+          return;
+        }
+        setFailed(true);
+      }}
       className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
     />
   );

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 
 from core.database.schema import DatabaseManager
+from core.services.media_processor import MediaProcessor
 from core.utils.logger import get_logger
-from routers.dependencies import get_database
-from routers.media import resolve_media_url, resolve_overlay_path, resolve_preview_url
+from routers.dependencies import get_database, get_media_processor
+from routers.media import (
+    queue_missing_video_derivatives,
+    resolve_media_url,
+    resolve_overlay_path,
+    resolve_preview_url,
+)
 
 router = APIRouter(prefix="/api/chats", tags=["chats"])
 logger = get_logger("ChatsRouter")
@@ -26,9 +32,11 @@ def list_conversations(
 def list_conversation_messages(
     account_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     db: DatabaseManager = Depends(get_database),
+    processor: MediaProcessor = Depends(get_media_processor),
 ) -> dict[str, int | str | list[dict]]:
     try:
         conversations = {item["username"] for item in db.get_conversations()}
@@ -75,6 +83,13 @@ def list_conversation_messages(
                                 ),
                                 "overlay_url": resolve_media_url(request, overlay),
                             }
+                        )
+                        queue_missing_video_derivatives(
+                            background_tasks,
+                            processor,
+                            file_path,
+                            file_type=file_type,
+                            overlay_path=overlay,
                         )
                     except Exception as exc:
                         logger.error(

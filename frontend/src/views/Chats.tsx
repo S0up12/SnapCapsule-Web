@@ -111,7 +111,7 @@ function ChatMediaPlaceholder({ video }: { video: boolean }) {
       <div className="flex flex-col items-center gap-2">
         {video ? <Video className="h-8 w-8" /> : <ImageIcon className="h-8 w-8" />}
         <span className="text-xs font-medium uppercase tracking-[0.18em]">
-          {video ? "Video unavailable" : "Preview unavailable"}
+          {video ? "Video preview pending" : "Preview unavailable"}
         </span>
       </div>
     </div>
@@ -121,16 +121,37 @@ function ChatMediaPlaceholder({ video }: { video: boolean }) {
 type ChatMediaPreviewProps = {
   media: ChatMedia;
   messageTitle: string;
+  assumedVideo: boolean;
   onOpen: (selection: SelectedMedia) => void;
 };
 
-function ChatMediaPreview({ media, messageTitle, onOpen }: ChatMediaPreviewProps) {
-  const video = isVideoMedia(media.media_url);
-  const previewUrl = media.thumbnail_url || (!video ? media.media_url : null);
+function ChatMediaPreview({
+  media,
+  messageTitle,
+  assumedVideo,
+  onOpen,
+}: ChatMediaPreviewProps) {
+  const video = assumedVideo || isVideoMedia(media.media_url);
+  const previewSources = video
+    ? media.thumbnail_url
+      ? [media.thumbnail_url]
+      : []
+    : [media.thumbnail_url, media.media_url].filter(
+        (value, index, items): value is string =>
+          Boolean(value) && items.indexOf(value) === index,
+      );
   const mediaUrl = media.media_url;
+  const [sourceIndex, setSourceIndex] = useState(0);
   const [failed, setFailed] = useState(false);
 
-  if (!previewUrl || failed) {
+  useEffect(() => {
+    setSourceIndex(0);
+    setFailed(false);
+  }, [assumedVideo, media.media_url, media.thumbnail_url]);
+
+  const activePreviewUrl = previewSources[sourceIndex] ?? null;
+
+  if (!activePreviewUrl || failed) {
     return <ChatMediaPlaceholder video={video} />;
   }
 
@@ -150,9 +171,10 @@ function ChatMediaPreview({ media, messageTitle, onOpen }: ChatMediaPreviewProps
         className="relative block w-full"
       >
         <img
-          src={previewUrl}
+          src={activePreviewUrl}
           alt={messageTitle}
           loading="lazy"
+          decoding="async"
           onError={() => setFailed(true)}
           className="max-h-[360px] w-full cursor-pointer bg-black object-cover transition-opacity hover:opacity-90"
         />
@@ -167,13 +189,20 @@ function ChatMediaPreview({ media, messageTitle, onOpen }: ChatMediaPreviewProps
 
   return (
     <img
-      src={previewUrl}
+      src={activePreviewUrl}
       alt={messageTitle}
       loading="lazy"
-      onError={() => setFailed(true)}
+      decoding="async"
+      onError={() => {
+        if (sourceIndex < previewSources.length - 1) {
+          setSourceIndex((current) => current + 1);
+          return;
+        }
+        setFailed(true);
+      }}
       onClick={() =>
         onOpen({
-          mediaUrl: mediaUrl || previewUrl,
+          mediaUrl: mediaUrl || activePreviewUrl,
           overlayUrl: media.overlay_url,
           isVideo: false,
           title: messageTitle,
@@ -572,6 +601,7 @@ export default function Chats() {
                                       <ChatMediaPreview
                                         media={media}
                                         messageTitle={message.content || "Chat media"}
+                                        assumedVideo={message.msg_type.toUpperCase() === "VIDEO"}
                                         onOpen={setSelectedMedia}
                                       />
                                     </div>

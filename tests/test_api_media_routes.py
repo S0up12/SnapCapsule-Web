@@ -54,9 +54,10 @@ class ChatsStubDB:
         }
 
 
-def _build_client(db) -> TestClient:
+def _build_client(db, processor: MediaProcessor) -> TestClient:
     app = FastAPI()
     app.state.db = db
+    app.state.processor = processor
     app.include_router(memories_router)
     app.include_router(chats_router)
     return TestClient(app)
@@ -75,9 +76,11 @@ def test_memories_route_skips_bad_rows_and_never_generates_media(
     monkeypatch.setenv("SNAPCAPSULE_RAW_MEDIA_DIR", str(raw_dir))
     monkeypatch.setenv("SNAPCAPSULE_CACHE_DIR", str(cache_dir))
 
-    media_path = raw_dir / "memories" / "2026-03-06_ABC-main.jpg"
+    stored_path = raw_dir / "memories" / "2026-03-06_ABC.jpg"
+    media_path = raw_dir / "memories" / "2026-03-06_ABC-main_thumb.jpg"
     media_path.parent.mkdir(parents=True, exist_ok=True)
     media_path.write_bytes(b"image")
+    processor = MediaProcessor(cache_dir=cache_dir)
 
     def _fail(*args, **kwargs):
         raise AssertionError("blocking media generation should not be called")
@@ -87,12 +90,12 @@ def test_memories_route_skips_bad_rows_and_never_generates_media(
 
     db = MemoriesStubDB(
         [
-            ("asset-1", str(media_path), "image", None, "2026", 1),
+            ("asset-1", str(stored_path), "image", None, "2026", 1),
             ("asset-2", None, "image", None, "2026", 0),
             ("bad-row",),
         ]
     )
-    client = _build_client(db)
+    client = _build_client(db, processor)
 
     caplog.set_level(logging.ERROR)
     response = client.get("/api/memories/")
@@ -101,8 +104,8 @@ def test_memories_route_skips_bad_rows_and_never_generates_media(
     payload = response.json()
     assert payload["total"] == 3
     assert len(payload["items"]) == 2
-    assert payload["items"][0]["media_url"] == "/media/raw/memories/2026-03-06_ABC-main.jpg"
-    assert payload["items"][0]["thumbnail_url"] == "/media/raw/memories/2026-03-06_ABC-main.jpg"
+    assert payload["items"][0]["media_url"] == "/media/raw/memories/2026-03-06_ABC-main_thumb.jpg"
+    assert payload["items"][0]["thumbnail_url"] == "/media/raw/memories/2026-03-06_ABC-main_thumb.jpg"
     assert payload["items"][1]["media_url"] is None
     assert payload["items"][1]["thumbnail_url"] is None
     assert payload["items"][1]["overlay_url"] is None
@@ -122,9 +125,11 @@ def test_chat_messages_route_uses_predicted_urls_and_skips_bad_messages(
     monkeypatch.setenv("SNAPCAPSULE_RAW_MEDIA_DIR", str(raw_dir))
     monkeypatch.setenv("SNAPCAPSULE_CACHE_DIR", str(cache_dir))
 
+    stored_path = raw_dir / "chat_media" / "2026-03-06_ABC.mp4"
     video_path = raw_dir / "chat_media" / "2026-03-06_ABC-main.mp4"
     video_path.parent.mkdir(parents=True, exist_ok=True)
     video_path.write_bytes(b"video")
+    processor = MediaProcessor(cache_dir=cache_dir)
 
     thumbnail_path = build_thumbnail_cache_path(cache_dir, video_path, (400, 400), False, None)
     thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +152,7 @@ def test_chat_messages_route_uses_predicted_urls_and_skips_bad_messages(
         timestamp="2026-03-06T22:58:48",
         msg_type="VIDEO",
         source="chat",
-        media_refs=[None, str(video_path)],
+        media_refs=[None, str(stored_path)],
     )
     invalid_message = object()
     db = ChatsStubDB(
@@ -156,14 +161,14 @@ def test_chat_messages_route_uses_predicted_urls_and_skips_bad_messages(
         media_map={
             101: [
                 {
-                    "file_path": str(video_path),
+                    "file_path": str(stored_path),
                     "overlay_path": None,
                     "file_type": "video",
                 }
             ]
         },
     )
-    client = _build_client(db)
+    client = _build_client(db, processor)
 
     caplog.set_level(logging.ERROR)
     response = client.get("/api/chats/friend.snap/messages")
@@ -178,3 +183,131 @@ def test_chat_messages_route_uses_predicted_urls_and_skips_bad_messages(
     assert media[0]["thumbnail_url"] == f"/media/cache/{thumbnail_path.name}"
     assert media[0]["overlay_url"] is None
     assert "Failed to parse chat message" in caplog.text
+
+
+def test_chat_messages_route_queues_missing_video_derivatives_in_background(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_root = tmp_path / "data"
+    raw_dir = data_root / "raw_media"
+    cache_dir = data_root / "cache"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SNAPCAPSULE_RAW_MEDIA_DIR", str(raw_dir))
+    monkeypatch.setenv("SNAPCAPSULE_CACHE_DIR", str(cache_dir))
+
+    stored_path = raw_dir / "chat_media" / "2026-03-06_ABC.mp4"
+    video_path = raw_dir / "chat_media" / "2026-03-06_ABC-main.mp4"
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"video")
+
+    processor = MediaProcessor(cache_dir=cache_dir)
+    queued: list[tuple[str, tuple[object, ...]]] = []
+
+    monkeypatch.setattr(
+        processor,
+        "queue_thumbnail",
+        lambda *args: queued.append(("thumbnail", args)),
+    )
+    monkeypatch.setattr(
+        processor,
+        "queue_web_media",
+        lambda *args: queued.append(("web", args)),
+    )
+
+    message = SimpleNamespace(
+        id=101,
+        sender="friend.snap",
+        content="Look at this",
+        timestamp="2026-03-06T22:58:48",
+        msg_type="VIDEO",
+        source="chat",
+        media_refs=[str(stored_path)],
+    )
+    db = ChatsStubDB(
+        [{"username": "friend.snap", "display_name": "Friend", "message_count": 1}],
+        [message],
+        media_map={
+            101: [
+                {
+                    "file_path": str(stored_path),
+                    "overlay_path": None,
+                    "file_type": "video",
+                }
+            ]
+        },
+    )
+    client = _build_client(db, processor)
+
+    response = client.get("/api/chats/friend.snap/messages")
+
+    assert response.status_code == 200
+    payload = response.json()
+    media = payload["items"][0]["media"][0]
+    assert media["media_url"] == "/media/raw/chat_media/2026-03-06_ABC-main.mp4"
+    assert media["thumbnail_url"] is None
+    assert ("thumbnail", (video_path, (400, 400), False, None, False)) in queued
+    assert ("web", (video_path, False)) in queued
+
+
+def test_chat_messages_route_does_not_queue_quarantined_video_derivatives(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    data_root = tmp_path / "data"
+    raw_dir = data_root / "raw_media"
+    cache_dir = data_root / "cache"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SNAPCAPSULE_RAW_MEDIA_DIR", str(raw_dir))
+    monkeypatch.setenv("SNAPCAPSULE_CACHE_DIR", str(cache_dir))
+
+    stored_path = raw_dir / "chat_media" / "2026-03-06_ABC.mp4"
+    video_path = raw_dir / "chat_media" / "2026-03-06_ABC-main.mp4"
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.write_bytes(b"video")
+
+    processor = MediaProcessor(cache_dir=cache_dir)
+    processor.quarantine_path(video_path)
+    queued: list[tuple[str, tuple[object, ...]]] = []
+
+    monkeypatch.setattr(
+        processor,
+        "queue_thumbnail",
+        lambda *args: queued.append(("thumbnail", args)),
+    )
+    monkeypatch.setattr(
+        processor,
+        "queue_web_media",
+        lambda *args: queued.append(("web", args)),
+    )
+
+    message = SimpleNamespace(
+        id=101,
+        sender="friend.snap",
+        content="Look at this",
+        timestamp="2026-03-06T22:58:48",
+        msg_type="VIDEO",
+        source="chat",
+        media_refs=[str(stored_path)],
+    )
+    db = ChatsStubDB(
+        [{"username": "friend.snap", "display_name": "Friend", "message_count": 1}],
+        [message],
+        media_map={
+            101: [
+                {
+                    "file_path": str(stored_path),
+                    "overlay_path": None,
+                    "file_type": "video",
+                }
+            ]
+        },
+    )
+    client = _build_client(db, processor)
+
+    response = client.get("/api/chats/friend.snap/messages")
+
+    assert response.status_code == 200
+    assert queued == []

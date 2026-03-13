@@ -1,7 +1,7 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.0
 numpy<2
-pillow==10.2.0
+pyvips==2.2.3
 opencv-python==4.9.0.80
 beautifulsoup4==4.12.3
 pydantic==2.6.1

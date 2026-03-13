@@ -29,4 +29,6 @@ services:
       - snapcapsule-backend
     ports:
       - "${FRONTEND_PORT:-3000}:80"
+    volumes:
+      - ${CACHE_DIR:-./data/cache}:/data/cache:ro
     restart: unless-stopped
